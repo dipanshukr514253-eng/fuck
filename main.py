@@ -1,9 +1,18 @@
 """
-Telegram Channel Manager Bot  (fixed rewrite)
+Telegram Channel Manager Bot  (Phase 1: core bug fixes)
 Pyrogram bot + userbot, SQLAlchemy async, APScheduler, FSM.
 
 .env keys: BOT_TOKEN, OWNER_ID, API_ID, API_HASH, DATABASE_URL, LOG_LEVEL
 Run:  pip install -r requirements.txt && python bot.py
+
+Phase 1 changes (see CHANGELOG in the reply):
+  * Telegram is the source of truth for pending requests / member counts; every number is
+    labelled LIVE / CACHED / LOCAL and never mislabelled.
+  * Safe per-channel reconciliation (never wipes DB rows on a failed listing).
+  * Channel-scoped search (ID, @username, partial name) with live status verification.
+  * Paginated join-request panel, channel-scoped accept/decline, honest bulk processing.
+  * Member history tracking (first/last join, last leave), unique (channel_id,user_id).
+  * Durable error handling in migrations; FSM flows expire; duplicate event handling fixed.
 """
 
 import asyncio
@@ -68,8 +77,10 @@ from sqlalchemy import (
     Text,
     delete,
     func,
+    or_,
     select,
     text,
+    update,
 )
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import declarative_base
@@ -172,6 +183,7 @@ class JoinRequest(Base):
     status = Column(String(20), default="pending", index=True)
     requested_at = Column(DateTime, default=now_utc)
     processed_at = Column(DateTime, nullable=True)
+    source = Column(String(20), default="event")   # event | sync
 
 
 class Member(Base):
@@ -180,8 +192,13 @@ class Member(Base):
     channel_id = Column(BigInteger, index=True, nullable=False)
     user_id = Column(BigInteger, index=True, nullable=False)
     first_name = Column(String(255), default="")
+    last_name = Column(String(255), default="")
     username = Column(String(255), default="")
-    joined_at = Column(DateTime, default=now_utc)
+    joined_at = Column(DateTime, default=now_utc)        # legacy: first join
+    first_joined_at = Column(DateTime, nullable=True)
+    last_joined_at = Column(DateTime, nullable=True)
+    last_left_at = Column(DateTime, nullable=True)
+    last_verified_at = Column(DateTime, nullable=True)   # last live Telegram check
     is_active = Column(Boolean, default=True)
 
 
@@ -289,13 +306,76 @@ _T = "1" if IS_SQLITE else "TRUE"
 _F = "0" if IS_SQLITE else "FALSE"
 
 
+def _is_duplicate_column_error(exc: Exception) -> bool:
+    """True only when the failure means 'column already exists' (safe to ignore)."""
+    msg = str(exc).lower()
+    return ("duplicate column" in msg or "already exists" in msg)
+
+
 async def _add_column_if_missing(table: str, col: str, col_def: str):
-    """Each ALTER runs in its OWN transaction so one failure never aborts the rest."""
+    """Each ALTER runs in its OWN transaction so one failure never aborts the rest.
+    Only an 'already exists' error is ignored; anything else is logged loudly."""
     try:
         async with engine.begin() as conn:
             await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {col_def}"))
-    except Exception:
-        pass  # already exists
+        logger.info("Migration: added %s.%s", table, col)
+    except Exception as exc:
+        if not _is_duplicate_column_error(exc):
+            logger.error("Migration FAILED for %s.%s: %s", table, col, exc)
+
+
+async def _dedupe_members():
+    """Collapse duplicate (channel_id, user_id) rows so the unique index can be created.
+    Keeps the row with the lowest id, ORs is_active, keeps earliest joined_at."""
+    async with SessionLocal() as s:
+        rows = (await s.execute(select(Member).order_by(Member.id))).scalars().all()
+        seen: dict = {}
+        removed = 0
+        for m in rows:
+            key = (m.channel_id, m.user_id)
+            keep = seen.get(key)
+            if keep is None:
+                seen[key] = m
+                continue
+            keep.is_active = bool(keep.is_active or m.is_active)
+            if m.joined_at and (keep.joined_at is None or m.joined_at < keep.joined_at):
+                keep.joined_at = m.joined_at
+            keep.first_name = keep.first_name or m.first_name
+            keep.username = keep.username or m.username
+            await s.delete(m)
+            removed += 1
+        if removed:
+            await s.commit()
+            logger.info("Migration: merged %d duplicate member row(s)", removed)
+
+
+async def _dedupe_pending_requests():
+    """At most one 'pending' row per (channel_id, user_id)."""
+    async with SessionLocal() as s:
+        rows = (await s.execute(select(JoinRequest).where(
+            JoinRequest.status == "pending").order_by(JoinRequest.id))).scalars().all()
+        seen: set = set()
+        changed = 0
+        for r in rows:
+            key = (r.channel_id, r.user_id)
+            if key in seen:
+                r.status = "expired"
+                r.processed_at = now_utc()
+                changed += 1
+            else:
+                seen.add(key)
+        if changed:
+            await s.commit()
+            logger.info("Migration: expired %d duplicate pending request(s)", changed)
+
+
+async def _create_index(name: str, ddl: str):
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text(ddl))
+    except Exception as exc:
+        if not _is_duplicate_column_error(exc):
+            logger.error("Index %s failed: %s", name, exc)
 
 
 async def init_db():
@@ -328,9 +408,39 @@ async def init_db():
         ("global_settings", "notif_member_join", f"BOOLEAN DEFAULT {_T}"),
         ("global_settings", "notif_member_leave", f"BOOLEAN DEFAULT {_F}"),
         ("global_settings", "notif_auto_accept", f"BOOLEAN DEFAULT {_T}"),
+        # Phase 1 additions
+        ("members", "last_name", "VARCHAR(255) DEFAULT ''"),
+        ("members", "first_joined_at", "TIMESTAMP"),
+        ("members", "last_joined_at", "TIMESTAMP"),
+        ("members", "last_left_at", "TIMESTAMP"),
+        ("members", "last_verified_at", "TIMESTAMP"),
+        ("join_requests", "source", "VARCHAR(20) DEFAULT 'event'"),
     ]
     for table, col, col_def in migrations:
         await _add_column_if_missing(table, col, col_def)
+
+    # Backfill new timestamp columns from legacy joined_at (only where empty)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text(
+                "UPDATE members SET first_joined_at = joined_at WHERE first_joined_at IS NULL"))
+            await conn.execute(text(
+                "UPDATE members SET last_joined_at = joined_at WHERE last_joined_at IS NULL"))
+    except Exception as exc:
+        logger.error("Member timestamp backfill failed: %s", exc)
+
+    await _dedupe_members()
+    await _dedupe_pending_requests()
+    await _create_index(
+        "uq_members_channel_user",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_members_channel_user ON members (channel_id, user_id)")
+    await _create_index(
+        "ix_jr_channel_user_status",
+        "CREATE INDEX IF NOT EXISTS ix_jr_channel_user_status "
+        "ON join_requests (channel_id, user_id, status)")
+    await _create_index(
+        "ix_leaves_channel_left",
+        "CREATE INDEX IF NOT EXISTS ix_leaves_channel_left ON member_leaves (channel_id, left_at)")
 
     async with SessionLocal() as s:
         gs = (await s.execute(select(GlobalSettings))).scalars().first()
@@ -438,23 +548,38 @@ class St(Enum):
     AUTO_REPLY_BTN_URL = auto()
 
 
+FLOW_TTL_SECONDS = 15 * 60       # an abandoned prompt stops capturing messages after 15 min
+
+
 @dataclass
 class Flow:
     state: St = St.NONE
     data: dict = field(default_factory=dict)
+    touched: float = 0.0          # monotonic time of last interaction
 
 
 flows: dict = {}
 
 
+def _mono() -> float:
+    return asyncio.get_event_loop().time()
+
+
 def flow(uid: int) -> Flow:
-    if uid not in flows:
-        flows[uid] = Flow()
-    return flows[uid]
+    """Per-admin state. A flow idle longer than FLOW_TTL_SECONDS is reset, so a forgotten
+    prompt can never swallow a normal message later. Each admin has an isolated Flow."""
+    f = flows.get(uid)
+    now = _mono()
+    if f is None or (f.state != St.NONE and now - f.touched > FLOW_TTL_SECONDS):
+        if f is not None and f.state != St.NONE:
+            logger.info("flow expired admin_id=%s state=%s", uid, f.state.name)
+        f = flows[uid] = Flow()
+    f.touched = now
+    return f
 
 
 def reset_flow(uid: int):
-    flows[uid] = Flow()
+    flows[uid] = Flow(touched=_mono())
 
 
 # ===========================================================================
@@ -526,6 +651,7 @@ async def notify_admins(text_msg: str, reply_markup=None, exclude: Optional[int]
 
 def kb_main_panel(logged_in: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏳ Join Requests", callback_data="reqs:overview")],
         [InlineKeyboardButton("✅ Accept All", callback_data="req:accept_all"),
          InlineKeyboardButton("❌ Decline All", callback_data="req:decline_all")],
         [InlineKeyboardButton("🔍 Search", callback_data="search:start"),
@@ -670,6 +796,29 @@ def kb_channel_notify(channel_id: int) -> InlineKeyboardMarkup:
     ])
 
 
+def pager_row(prefix: str, page: int, pages: int) -> list:
+    """[⬅️ Previous] [Page 2/8] [Next ➡️]. prefix is the callback base; page is appended."""
+    row = []
+    if page > 1:
+        row.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"{prefix}:{page - 1}"))
+    row.append(InlineKeyboardButton(f"Page {page}/{pages}", callback_data="noop"))
+    if page < pages:
+        row.append(InlineKeyboardButton("Next ➡️", callback_data=f"{prefix}:{page + 1}"))
+    return row
+
+
+def kb_join_request_actions(channel_id: int, user_id: int) -> InlineKeyboardMarkup:
+    """Per-request buttons. channel_id is embedded so we act on the RIGHT channel."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Accept", callback_data=f"jr:accept:{channel_id}:{user_id}"),
+         InlineKeyboardButton("❌ Decline", callback_data=f"jr:decline:{channel_id}:{user_id}")],
+        [InlineKeyboardButton("👁 Profile", callback_data=f"user:profile:{channel_id}:{user_id}"),
+         InlineKeyboardButton("🔄 Refresh", callback_data=f"jr:refresh:{channel_id}:{user_id}")],
+        [InlineKeyboardButton("✅ Accept All", callback_data=f"req:accept_all:{channel_id}"),
+         InlineKeyboardButton("❌ Decline All", callback_data=f"req:decline_all:{channel_id}")],
+    ])
+
+
 def kb_user_actions(user_id: int, is_pending: bool, is_member: bool) -> InlineKeyboardMarkup:
     rows = []
     if is_pending:
@@ -768,8 +917,8 @@ async def mark_user_blocked(user_id: int):
             if ku:
                 ku.bot_blocked = True
                 await s.commit()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.error("mark_user_blocked failed user_id=%s: %s: %s", user_id, type(exc).__name__, exc)
 
 
 async def _send_configured(user_id: int, text_out: str, media_type: str, media_id: str, markup):
@@ -866,108 +1015,301 @@ async def process_join_request(channel_id: int, user_id: int, approve: bool) -> 
     return "fail"
 
 
-async def record_member(channel_id: int, user_id: int, first_name: str, username: str):
-    """Upsert into members table (so Remove/Mute/Ban work and counts are real)."""
+async def record_member(channel_id: int, user_id: int, first_name: str, username: str,
+                        last_name: str = ""):
+    """Upsert a member. Preserves history: first_joined_at is set once, last_joined_at
+    updates on every (re)join, and a rejoin flips is_active back on."""
+    now = now_utc()
     async with SessionLocal() as s:
         m = (await s.execute(select(Member).where(
             Member.channel_id == channel_id, Member.user_id == user_id))).scalars().first()
         if m is None:
             s.add(Member(channel_id=channel_id, user_id=user_id,
-                         first_name=first_name or "", username=username or "", is_active=True))
+                         first_name=first_name or "", last_name=last_name or "",
+                         username=username or "", is_active=True, joined_at=now,
+                         first_joined_at=now, last_joined_at=now))
         else:
+            if not m.is_active:                       # rejoin
+                m.last_joined_at = now
+            elif m.last_joined_at is None:
+                m.last_joined_at = m.joined_at or now
+            if m.first_joined_at is None:
+                m.first_joined_at = m.joined_at or now
             m.is_active = True
             m.first_name = first_name or m.first_name
+            m.last_name = last_name or m.last_name
             m.username = username or m.username
-        await s.commit()
+        try:
+            await s.commit()
+        except Exception as exc:
+            # A concurrent event inserted the same (channel,user) first -> unique index hit.
+            await s.rollback()
+            logger.info("record_member race on ch=%s user=%s (%s); retrying as update",
+                        channel_id, user_id, type(exc).__name__)
+            m = (await s.execute(select(Member).where(
+                Member.channel_id == channel_id, Member.user_id == user_id))).scalars().first()
+            if m is not None:
+                if not m.is_active:
+                    m.last_joined_at = now
+                m.is_active = True
+                await s.commit()
 
 
-async def deactivate_member(channel_id: int, user_id: int):
+async def deactivate_member(channel_id: int, user_id: int) -> bool:
+    """Mark a member as left. Returns True only if they WERE active (so callers can
+    skip duplicate leave events / duplicate leave messages)."""
+    now = now_utc()
     async with SessionLocal() as s:
         rows = (await s.execute(select(Member).where(
             Member.channel_id == channel_id, Member.user_id == user_id))).scalars().all()
+        was_active = False
         for m in rows:
+            if m.is_active:
+                was_active = True
             m.is_active = False
+            m.last_left_at = now
         await s.commit()
+    return was_active
+
+
+async def apply_request_decision(channel_id: int, user_id: int, approve: bool) -> str:
+    """Accept/decline ONE request on the right channel. Only marks 'accepted' when
+    Telegram confirmed it. Returns an HTML status line for the admin."""
+    async with SessionLocal() as session:
+        jr = (await session.execute(select(JoinRequest).where(
+            JoinRequest.channel_id == channel_id, JoinRequest.user_id == user_id,
+            JoinRequest.status == "pending"))).scalars().first()
+    if jr is None:
+        return "ℹ️ No pending request for that user in this channel (already handled?)."
+
+    result = await process_join_request(channel_id, user_id, approve)
+    if result == "fail":
+        logger.warning("decision FAILED channel_id=%s user_id=%s approve=%s", channel_id, user_id, approve)
+        return ("❌ Telegram did not accept the action. The request is still pending.\n"
+                "Check that the userbot is an admin with the invite-users right.")
+
+    async with SessionLocal() as session:
+        row = (await session.execute(select(JoinRequest).where(JoinRequest.id == jr.id))).scalar_one_or_none()
+        if row:
+            row.status = ("accepted" if approve else "declined") if result == "ok" else "expired"
+            row.processed_at = now_utc()
+            await session.commit()
+    _pending_cache.pop(channel_id, None)
+    _member_cache.pop(channel_id, None)
+
+    if result == "gone":
+        return "ℹ️ That request was already handled on Telegram — cleared from pending."
+    if approve:
+        await record_member(channel_id, user_id, jr.first_name, jr.username, jr.last_name or "")
+        await send_join_message(channel_id, await get_channel_name(channel_id), user_id,
+                                jr.first_name, jr.last_name or "", jr.username)
+    logger.info("decision OK channel_id=%s user_id=%s approve=%s", channel_id, user_id, approve)
+    return f"{'✅ Accepted' if approve else '❌ Declined'} user <code>{user_id}</code>."
+
+
+_bulk_running: set = set()      # channel keys currently being bulk-processed
 
 
 async def bulk_process_requests(chat_id: int, channel_id: Optional[int], approve: bool):
+    """Accept/decline all pending requests. Telegram is authoritative: we first reconcile
+    the DB with Telegram's real list, then process, then report exactly what happened."""
     if not await userbot_ready():
         await bot.send_message(
             chat_id, "⚠️ Userbot isn't logged in yet. Open <b>🔐 Userbot Login</b> first.",
             parse_mode=HTML, reply_markup=kb_back())
         return
 
+    key = channel_id if channel_id is not None else "all"
+    if key in _bulk_running or (channel_id is not None and "all" in _bulk_running) \
+            or (channel_id is None and _bulk_running):
+        await bot.send_message(chat_id, "⏳ A bulk operation is already running. Wait for it to finish.",
+                               reply_markup=kb_back())
+        return
+    _bulk_running.add(key)
+    try:
+        await _bulk_process_inner(chat_id, channel_id, approve)
+    finally:
+        _bulk_running.discard(key)
+
+
+async def _bulk_process_inner(chat_id: int, channel_id: Optional[int], approve: bool):
+    label = "Accepting" if approve else "Declining"
+    progress = await bot.send_message(chat_id, f"🔄 Syncing pending requests from Telegram…")
+
+    # 1) Reconcile with Telegram so we act on the REAL list, not stale DB rows.
+    async with SessionLocal() as s:
+        q = select(Channel).where(Channel.is_active == True)  # noqa: E712
+        if channel_id is not None:
+            q = q.where(Channel.channel_id == channel_id)
+        channels = (await s.execute(q)).scalars().all()
+    sync_warnings = []
+    for ch in channels:
+        _, err = await sync_channel_requests(ch.channel_id)
+        if err:
+            sync_warnings.append(f"{esc(ch.name)}: {esc(err)}")
+
     async with SessionLocal() as session:
         q = select(JoinRequest).where(JoinRequest.status == "pending")
         if channel_id is not None:
             q = q.where(JoinRequest.channel_id == channel_id)
-        requests = (await session.execute(q)).scalars().all()
+        requests = (await session.execute(q.order_by(JoinRequest.requested_at))).scalars().all()
 
     total = len(requests)
     if total == 0:
-        await bot.send_message(chat_id, "No pending requests found.", reply_markup=kb_back())
+        txt = "No pending requests found on Telegram."
+        if sync_warnings:
+            txt += "\n\n⚠️ Live sync problems (results may be incomplete):\n" + "\n".join(sync_warnings)
+        await safe_edit(progress, txt, kb_back())
         return
 
-    label = "Accepted" if approve else "Declined"
-    progress = await bot.send_message(chat_id, f"⏳ {label} 0/{total} requests…")
-    done = failed = stale = 0
+    counters = {"ok": 0, "gone": 0, "fail": 0}
     ch_names: dict = {}
+    processed = 0
     last_edit = 0.0
+    sem = asyncio.Semaphore(3)               # bounded concurrency: fast but flood-safe
+    lock = asyncio.Lock()
 
-    for idx, req in enumerate(requests, 1):
-        result = await process_join_request(req.channel_id, req.user_id, approve)
+    async def handle(req: JoinRequest):
+        nonlocal processed, last_edit
+        async with sem:
+            result = await process_join_request(req.channel_id, req.user_id, approve)
+            await asyncio.sleep(BULK_APPROVE_INTERVAL)
         if result in ("ok", "gone"):
-            async with SessionLocal() as session:
-                fresh = (await session.execute(
-                    select(JoinRequest).where(JoinRequest.id == req.id))).scalar_one_or_none()
-                if fresh:
-                    if result == "ok":
-                        fresh.status = "accepted" if approve else "declined"
-                    else:
-                        fresh.status = "expired"   # no longer pending on Telegram
-                    fresh.processed_at = now_utc()
-                    await session.commit()
-            if result == "ok":
-                done += 1
-                if approve:
-                    await record_member(req.channel_id, req.user_id, req.first_name, req.username)
+            try:
+                async with SessionLocal() as session:
+                    row = (await session.execute(
+                        select(JoinRequest).where(JoinRequest.id == req.id))).scalar_one_or_none()
+                    if row:
+                        row.status = (("accepted" if approve else "declined")
+                                      if result == "ok" else "expired")
+                        row.processed_at = now_utc()
+                        await session.commit()
+            except Exception as exc:
+                logger.exception("bulk: DB update failed req=%s: %s", req.id, exc)
+            if result == "ok" and approve:
+                try:
+                    await record_member(req.channel_id, req.user_id, req.first_name,
+                                        req.username, req.last_name or "")
                     if req.channel_id not in ch_names:
                         ch_names[req.channel_id] = await get_channel_name(req.channel_id)
-                    await send_join_message(req.channel_id, ch_names[req.channel_id],
-                                            req.user_id, req.first_name, req.last_name or "",
-                                            req.username)
-            else:
-                stale += 1
-        else:
-            failed += 1
+                    await send_join_message(req.channel_id, ch_names[req.channel_id], req.user_id,
+                                            req.first_name, req.last_name or "", req.username)
+                except Exception as exc:
+                    logger.exception("bulk: post-accept step failed user=%s: %s", req.user_id, exc)
+        async with lock:
+            counters[result] += 1
+            processed += 1
+            now = asyncio.get_event_loop().time()
+            if now - last_edit > 2.0:
+                last_edit = now
+                await safe_edit(
+                    progress,
+                    f"⏳ {label}…\n\nProgress: {processed} / {total}\n\n"
+                    f"{'✅ Accepted' if approve else '❌ Declined'}: {counters['ok']}\n"
+                    f"⚠️ Already handled: {counters['gone']}\n❌ Failed: {counters['fail']}")
 
-        await asyncio.sleep(BULK_APPROVE_INTERVAL)
-        loop_now = asyncio.get_event_loop().time()
-        if loop_now - last_edit > 2.0:
-            last_edit = loop_now
-            try:
-                await progress.edit_text(
-                    f"⏳ {label} {done}/{total} … (skipped {stale}, failed {failed})")
-            except Exception:
-                pass
+    await asyncio.gather(*(handle(r) for r in requests))
 
-    final = f"✅ {label} {done}/{total} requests complete."
-    if stale:
-        final += f"\nℹ️ {stale} were already handled on Telegram — cleared from pending."
-    if failed:
-        final += f"\n⚠️ {failed} failed (check that the userbot is admin with invite permission)."
-    try:
-        await progress.edit_text(final, reply_markup=kb_back())
-    except Exception:
-        await bot.send_message(chat_id, final, reply_markup=kb_back())
+    for ch in channels:
+        _pending_cache.pop(ch.channel_id, None)
+        _member_cache.pop(ch.channel_id, None)
+
+    final = (f"{'✅' if counters['fail'] == 0 else '⚠️'} <b>Bulk {('accept' if approve else 'decline')} "
+             f"finished</b>\n\nProcessed: {processed} / {total}\n"
+             f"{'✅ Accepted' if approve else '❌ Declined'}: {counters['ok']}\n"
+             f"⚠️ Already handled on Telegram: {counters['gone']}\n"
+             f"❌ Failed (still pending): {counters['fail']}")
+    if counters["fail"]:
+        final += "\n\nFailures usually mean the userbot lacks the invite-users admin right."
+    if sync_warnings:
+        final += "\n\n⚠️ Live sync problems:\n" + "\n".join(sync_warnings)
+    logger.info("bulk_%s done total=%s ok=%s gone=%s fail=%s", "accept" if approve else "decline",
+                total, counters["ok"], counters["gone"], counters["fail"])
+    await safe_edit(progress, final, kb_back())
+
+
+_sync_locks: dict = {}          # channel_id -> asyncio.Lock (no overlapping syncs)
+
+
+def _sync_lock(channel_id: int) -> asyncio.Lock:
+    lk = _sync_locks.get(channel_id)
+    if lk is None:
+        lk = _sync_locks[channel_id] = asyncio.Lock()
+    return lk
+
+
+async def sync_channel_requests(channel_id: int):
+    """Reconcile ONE channel's pending requests against Telegram (source of truth).
+
+    Returns (live_pending_count, error). error is None only when the FULL list was
+    read successfully. On any listing failure we change NOTHING in the DB, so a
+    network hiccup can never wipe real pending requests.
+    """
+    if not await userbot_ready():
+        return 0, "userbot not connected"
+
+    async with _sync_lock(channel_id):
+        live: dict = {}
+        try:
+            async for r in userbot.get_chat_join_requests(channel_id):
+                user = getattr(r, "user", None) or getattr(r, "from_user", None)
+                if user is None:
+                    continue
+                live[user.id] = (user.first_name or "", user.last_name or "", user.username or "",
+                                 getattr(r, "date", None))
+        except FloodWait as fw:
+            wait_s = int(getattr(fw, "value", 1))
+            logger.warning("sync_requests channel=%s FloodWait %ss", channel_id, wait_s)
+            return 0, f"FloodWait {wait_s}s"
+        except Exception as exc:
+            logger.warning("sync_requests channel=%s list failed: %s: %s",
+                           channel_id, type(exc).__name__, exc)
+            return 0, f"{type(exc).__name__}: {str(exc)[:80]}"
+
+        # Full list read OK -> safe to reconcile.
+        now = now_utc()
+        try:
+            async with SessionLocal() as s:
+                rows = (await s.execute(select(JoinRequest).where(
+                    JoinRequest.channel_id == channel_id,
+                    JoinRequest.status == "pending"))).scalars().all()
+                by_user = {}
+                for row in rows:
+                    if row.user_id in by_user:          # stray duplicate pending row
+                        row.status = "expired"
+                        row.processed_at = now
+                    else:
+                        by_user[row.user_id] = row
+
+                for uid, (fn, ln, un, dt) in live.items():
+                    row = by_user.get(uid)
+                    if row is None:
+                        req_time = dt.replace(tzinfo=None) if getattr(dt, "tzinfo", None) else (dt or now)
+                        s.add(JoinRequest(channel_id=channel_id, user_id=uid, first_name=fn,
+                                          last_name=ln, username=un, status="pending",
+                                          requested_at=req_time, source="sync"))
+                    else:
+                        row.first_name = fn or row.first_name
+                        row.last_name = ln or row.last_name
+                        row.username = un or row.username
+
+                for uid, row in by_user.items():
+                    if uid not in live:
+                        # No longer pending on Telegram: accepted/declined elsewhere or withdrawn.
+                        row.status = "expired"
+                        row.processed_at = now
+                await s.commit()
+        except Exception as exc:
+            logger.exception("sync_requests channel=%s DB reconcile failed: %s", channel_id, exc)
+            return 0, f"database error: {type(exc).__name__}"
+
+        _pending_cache[channel_id] = (len(live), now)
+        return len(live), None
 
 
 async def sync_pending_with_telegram(channel_id: Optional[int] = None) -> int:
-    """
-    Reconcile DB 'pending' against Telegram's real pending list (userbot).
-    Fixes requests that were handled while bot was offline / manually in the Telegram app.
-    Returns number of rows corrected.
-    """
+    """Back-compat wrapper (used at startup / periodic job). Returns how many
+    channels were reconciled successfully."""
     if not await userbot_ready():
         return 0
     async with SessionLocal() as s:
@@ -975,44 +1317,13 @@ async def sync_pending_with_telegram(channel_id: Optional[int] = None) -> int:
         if channel_id is not None:
             q = q.where(Channel.channel_id == channel_id)
         channels = (await s.execute(q)).scalars().all()
-
-    fixed = 0
+    ok = 0
     for ch in channels:
-        live_ids = set()
-        try:
-            async for r in userbot.get_chat_join_requests(ch.channel_id):
-                live_ids.add(r.user.id)
-                # also add ones we missed while offline
-                async with SessionLocal() as s:
-                    ex = (await s.execute(select(JoinRequest).where(
-                        JoinRequest.channel_id == ch.channel_id,
-                        JoinRequest.user_id == r.user.id,
-                        JoinRequest.status == "pending"))).scalars().first()
-                    if ex is None:
-                        s.add(JoinRequest(channel_id=ch.channel_id, user_id=r.user.id,
-                                          first_name=r.user.first_name or "",
-                                          last_name=r.user.last_name or "",
-                                          username=r.user.username or "", status="pending"))
-                        await s.commit()
-                        fixed += 1
-        except FloodWait as fw:
-            await asyncio.sleep(int(getattr(fw, "value", 1)) + 1)
-            continue
-        except Exception as exc:
-            logger.info("sync_pending: cannot list requests for %s: %s", ch.channel_id, exc)
-            continue
-
-        async with SessionLocal() as s:
-            db_pending = (await s.execute(select(JoinRequest).where(
-                JoinRequest.channel_id == ch.channel_id,
-                JoinRequest.status == "pending"))).scalars().all()
-            for jr in db_pending:
-                if jr.user_id not in live_ids:
-                    jr.status = "expired"
-                    jr.processed_at = now_utc()
-                    fixed += 1
-            await s.commit()
-    return fixed
+        _, err = await sync_channel_requests(ch.channel_id)
+        if err is None:
+            ok += 1
+        await asyncio.sleep(0.5)         # gentle pacing between channels
+    return ok
 
 
 # ===========================================================================
@@ -1275,7 +1586,11 @@ async def import_userbot_channels(me_id: int):
             continue
         try:
             member = await userbot.get_chat_member(chat.id, me_id)
-        except Exception:
+        except FloodWait as fw:
+            await asyncio.sleep(int(getattr(fw, "value", 1)) + 1)
+            continue
+        except Exception as exc:
+            logger.info("import_channels: skip %s (%s)", chat.id, type(exc).__name__)
             continue
         if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
             continue
@@ -1320,26 +1635,43 @@ async def _ensure_channel(chat) -> None:
         await s.commit()
 
 
-_seen_requests: dict = {}   # (chat_id,user_id) -> ts  — dedup between bot & userbot handlers
+_seen_events: dict = {}     # short-lived guard against the SAME event arriving twice
+_BOT_ID: int = 0            # cached once; avoids bot.get_me() on every member update
 
 
-def _dedup(key) -> bool:
-    """True if this event was already processed in the last 30s."""
+def _dedup(key, ttl: float = 30.0) -> bool:
+    """True if this exact event was already handled within ttl seconds.
+    In-memory only: it guards near-simultaneous duplicates. Durable correctness
+    comes from DB state checks (was_active / pending-row lookups) below."""
     now = asyncio.get_event_loop().time()
-    for k in [k for k, t in _seen_requests.items() if now - t > 30]:
-        _seen_requests.pop(k, None)
-    if key in _seen_requests:
+    for k in [k for k, t in _seen_events.items() if now - t > ttl]:
+        _seen_events.pop(k, None)
+    if key in _seen_events:
         return True
-    _seen_requests[key] = now
+    _seen_events[key] = now
     return False
+
+
+async def _get_bot_id() -> int:
+    global _BOT_ID
+    if not _BOT_ID and bot is not None:
+        try:
+            _BOT_ID = (await bot.get_me()).id
+        except Exception as exc:
+            logger.warning("get_me failed: %s", exc)
+    return _BOT_ID
 
 
 async def _on_join_request(client: Client, request: ChatJoinRequest):
     chat = request.chat
     u = request.from_user
-    if _dedup(("jr", chat.id, u.id)):
+    if u is None:
         return
-    logger.info("Join request from %s in %s", u.id, chat.id)
+    req_ts = getattr(request, "date", None)
+    req_ts = int(req_ts.timestamp()) if hasattr(req_ts, "timestamp") else 0
+    if _dedup(("jr", chat.id, u.id, req_ts)):
+        return
+    logger.info("join_request channel_id=%s user_id=%s", chat.id, u.id)
 
     await _ensure_channel(chat)
     async with SessionLocal() as session:
@@ -1349,12 +1681,19 @@ async def _on_join_request(client: Client, request: ChatJoinRequest):
         if ex is None:
             session.add(JoinRequest(
                 channel_id=chat.id, user_id=u.id, first_name=u.first_name or "",
-                last_name=u.last_name or "", username=u.username or "", status="pending"))
-            await session.commit()
+                last_name=u.last_name or "", username=u.username or "",
+                status="pending", source="event"))
+        else:
+            ex.first_name = u.first_name or ex.first_name
+            ex.last_name = u.last_name or ex.last_name
+            ex.username = u.username or ex.username
+        await session.commit()
         settings = await get_or_create_settings(session, chat.id)
         gs = await get_global_settings(session)
         auto = settings.auto_accept
+    _pending_cache.pop(chat.id, None)          # invalidate: count just changed
 
+    auto_failed_reason = ""
     if auto:
         result = await process_join_request(chat.id, u.id, approve=True)
         if result in ("ok", "gone"):
@@ -1367,28 +1706,38 @@ async def _on_join_request(client: Client, request: ChatJoinRequest):
                     jr.processed_at = now_utc()
                     await session.commit()
             if result == "ok":
-                await record_member(chat.id, u.id, u.first_name or "", u.username or "")
+                await record_member(chat.id, u.id, u.first_name or "", u.username or "",
+                                    u.last_name or "")
                 await send_join_message(chat.id, chat.title or "", u.id, u.first_name or "",
                                         u.last_name or "", u.username or "")
+                logger.info("auto_accept OK channel_id=%s user_id=%s", chat.id, u.id)
                 if gs.notif_auto_accept:
                     await notify_admins(f"✅ Auto-accepted: <b>{esc(u.first_name)}</b> "
                                         f"into <b>{esc(chat.title)}</b>")
+            _pending_cache.pop(chat.id, None)
             return
-        # auto-accept failed (userbot down?) → fall through and notify admins as pending
+        # Real failure: leave the request PENDING and tell admins the truth.
+        auto_failed_reason = ("userbot not connected" if not await userbot_ready()
+                              else "Telegram rejected the approval (check userbot admin rights)")
+        logger.warning("auto_accept FAILED channel_id=%s user_id=%s reason=%s",
+                       chat.id, u.id, auto_failed_reason)
 
-    if gs.notif_join_request:
-        async with SessionLocal() as session:
-            pending_count = (await session.execute(
-                select(func.count()).select_from(JoinRequest)
-                .where(JoinRequest.channel_id == chat.id, JoinRequest.status == "pending")
-            )).scalar()
+    if gs.notif_join_request or auto_failed_reason:
+        pending = await live_pending_count(chat.id, use_ttl=False)
+        members = await live_member_count(chat.id)
+        uname = esc("@" + u.username) if u.username else "no username"
         text_out = (
             f"🔔 <b>New join request</b>\n\n"
             f"Channel: <b>{esc(chat.title)}</b>\n"
-            f"User: <b>{esc(u.first_name)}</b> ({esc('@' + u.username) if u.username else 'no username'})\n"
-            f"ID: <code>{u.id}</code>\n\n"
-            f"Pending in this channel: {pending_count}")
-        await notify_admins(text_out, kb_channel_notify(chat.id))
+            f"User: <b>{esc(u.first_name)}</b> ({uname})\n"
+            f"ID: <code>{u.id}</code>\n"
+            f"Requested: {now_utc().strftime('%Y-%m-%d %H:%M:%S')} UTC\n\n"
+            f"⏳ Pending (Telegram): {pending.value}{src_tag(pending)}\n"
+            f"👥 Members: {members.value:,}{src_tag(members)}")
+        if auto_failed_reason:
+            text_out = (f"⚠️ <b>Auto-accept FAILED</b> — {esc(auto_failed_reason)}.\n"
+                        f"Request is still pending.\n\n") + text_out
+        await notify_admins(text_out, kb_join_request_actions(chat.id, u.id))
 
 
 async def _on_member_updated(client: Client, update: ChatMemberUpdated):
@@ -1400,42 +1749,53 @@ async def _on_member_updated(client: Client, update: ChatMemberUpdated):
     u = new.user
     if u is None:
         return
-    if _dedup(("mu", chat.id, u.id, str(new.status))):
+
+    if u.id == await _get_bot_id():
+        if not _dedup(("bot", chat.id, str(new.status))):
+            await _handle_bot_status(update)
         return
 
-    # Bot's own status change → handled separately (channel add/remove)
-    try:
-        me = await bot.get_me()
-        if u.id == me.id:
-            await _handle_bot_status(update)
-            return
-    except Exception:
-        pass
-
-    active = (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+    active = (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER,
+              ChatMemberStatus.RESTRICTED)
     left = (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
     old_status = old.status if old is not None else None
+    new_status = new.status
+
+    # Dedup on transition + Telegram's own event timestamp. True duplicates share the same
+    # timestamp; a genuine leave -> rejoin -> leave has different timestamps, so it is kept.
+    ev_ts = getattr(update, "date", None)
+    ev_ts = int(ev_ts.timestamp()) if hasattr(ev_ts, "timestamp") else 0
+    if _dedup(("mu", chat.id, u.id, str(old_status), str(new_status), ev_ts)):
+        return
+    _member_cache.pop(chat.id, None)             # count changed -> invalidate live cache
 
     async with SessionLocal() as session:
         gs = await get_global_settings(session)
 
-    if new.status in left and (old_status in active or old_status is None):
+    if new_status in left and (old_status in active or old_status is None):
         await _ensure_channel(chat)
-        await deactivate_member(chat.id, u.id)
+        # deactivate_member returns False if we already knew they had left -> no duplicate DM.
+        was_active = await deactivate_member(chat.id, u.id)
+        if not was_active and old_status is None:
+            logger.info("leave ignored (untracked, no prior state) ch=%s user=%s", chat.id, u.id)
+            return
         async with SessionLocal() as session:
             session.add(MemberLeave(channel_id=chat.id, user_id=u.id,
                                     first_name=u.first_name or "", username=u.username or ""))
             await session.commit()
-        await send_leave_message(chat.id, chat.title or "", u.id, u.first_name or "",
-                                 u.last_name or "", u.username or "")
+        logger.info("member_left channel_id=%s user_id=%s", chat.id, u.id)
+        if was_active or old_status in active:
+            await send_leave_message(chat.id, chat.title or "", u.id, u.first_name or "",
+                                     u.last_name or "", u.username or "")
         if gs.notif_member_leave:
             await notify_admins(f"🚪 <b>{esc(u.first_name)}</b> "
                                 f"({esc('@' + u.username) if u.username else 'no username'}) "
                                 f"left <b>{esc(chat.title)}</b>")
 
-    elif new.status in active and (old_status is None or old_status not in active):
+    elif new_status in active and (old_status is None or old_status not in active):
         await _ensure_channel(chat)
-        await record_member(chat.id, u.id, u.first_name or "", u.username or "")
+        await record_member(chat.id, u.id, u.first_name or "", u.username or "", u.last_name or "")
+        logger.info("member_joined channel_id=%s user_id=%s", chat.id, u.id)
         if gs.notif_member_join:
             await notify_admins(f"👤 <b>{esc(u.first_name)}</b> "
                                 f"({esc('@' + u.username) if u.username else 'no username'}) "
@@ -1481,36 +1841,150 @@ async def _handle_bot_status(update: ChatMemberUpdated):
 
 
 def register_userbot_handlers(client: Client):
-    client.add_handler(ChatJoinRequestHandler(_on_join_request))
-    client.add_handler(ChatMemberUpdatedHandler(_on_member_updated))
+    """The BOT client already receives join-request and member updates for every channel
+    it administers, so registering the same handlers on the userbot would run each event
+    twice. The userbot only handles channels the bot is NOT part of."""
+    async def _userbot_join(c: Client, request: ChatJoinRequest):
+        if await _bot_manages(request.chat.id):
+            return
+        await _on_join_request(c, request)
+
+    async def _userbot_member(c: Client, update: ChatMemberUpdated):
+        if await _bot_manages(update.chat.id):
+            return
+        await _on_member_updated(c, update)
+
+    client.add_handler(ChatJoinRequestHandler(_userbot_join))
+    client.add_handler(ChatMemberUpdatedHandler(_userbot_member))
+
+
+_bot_admin_cache: dict = {}     # channel_id -> (bool, ts)
+
+
+async def _bot_manages(channel_id: int) -> bool:
+    """True if the BOT is an admin of this channel (so it will get the events itself).
+    Cached for 5 minutes to avoid a Telegram call per event."""
+    now = asyncio.get_event_loop().time()
+    hit = _bot_admin_cache.get(channel_id)
+    if hit and now - hit[1] < 300:
+        return hit[0]
+    ok = False
+    try:
+        m = await bot.get_chat_member(channel_id, await _get_bot_id())
+        ok = m.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+    except Exception as exc:
+        logger.debug("bot admin check ch=%s failed: %s", channel_id, exc)
+    _bot_admin_cache[channel_id] = (ok, now)
+    return ok
 
 
 # ===========================================================================
 # LIVE COUNT HELPERS
 # ===========================================================================
 
-async def live_member_count(channel_id: int):
-    """Returns (count, is_live). Tries userbot, then bot, then cached DB count."""
-    for client in (userbot if await userbot_ready() else None, bot):
-        if client is None:
-            continue
+@dataclass
+class CountResult:
+    """A number plus WHERE it came from, so the UI never labels cached data as live."""
+    value: int
+    source: str                 # "LIVE" | "CACHED" | "LOCAL"
+    reason: str = ""            # why we fell back (for logs / admin hint)
+    fetched_at: Optional[datetime] = None
+
+    @property
+    def is_live(self) -> bool:
+        return self.source == "LIVE"
+
+
+# channel_id -> (count, fetched_at) : last SUCCESSFUL Telegram result
+_member_cache: dict = {}
+_pending_cache: dict = {}
+CACHE_TTL_SECONDS = 20          # live results reused briefly to avoid API hammering
+
+
+async def _client_member_count(client: Client, channel_id: int) -> int:
+    """Works across pyrogram 2.0.x (get_chat_members_count) and newer forks
+    (get_chat_member_count). Picks whichever this install actually provides."""
+    fn = getattr(client, "get_chat_members_count", None) or getattr(client, "get_chat_member_count", None)
+    if fn is None:
+        raise RuntimeError("No member-count method on this Pyrogram version")
+    return int(await fn(channel_id))
+
+
+async def live_member_count(channel_id: int, use_ttl: bool = True) -> CountResult:
+    """LIVE from Telegram when possible; else CACHED (last good Telegram value);
+    else LOCAL (DB active-member rows). Never raises; logs the exact reason."""
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    cached = _member_cache.get(channel_id)
+    if use_ttl and cached and (now - cached[1]).total_seconds() < CACHE_TTL_SECONDS:
+        return CountResult(cached[0], "LIVE", fetched_at=cached[1])
+
+    reasons = []
+    clients = []
+    if await userbot_ready():
+        clients.append(("userbot", userbot))
+    if bot is not None:
+        clients.append(("bot", bot))
+    for label, client in clients:
         try:
-            cnt = await flood_safe(lambda c=client: c.get_chat_members_count(channel_id))
-            return int(cnt), True
-        except Exception:
-            continue
+            cnt = await flood_safe(lambda c=client: _client_member_count(c, channel_id))
+            _member_cache[channel_id] = (cnt, now)
+            return CountResult(cnt, "LIVE", fetched_at=now)
+        except Exception as exc:
+            reasons.append(f"{label}: {type(exc).__name__}")
+            logger.warning("member_count channel=%s via %s failed: %s: %s",
+                           channel_id, label, type(exc).__name__, exc)
+
+    reason = "; ".join(reasons) or "no client available"
+    if cached:
+        return CountResult(cached[0], "CACHED", reason=reason, fetched_at=cached[1])
+
     async with SessionLocal() as s:
         cnt = (await s.execute(select(func.count()).select_from(Member).where(
             Member.channel_id == channel_id, Member.is_active == True))).scalar()  # noqa: E712
-    return int(cnt or 0), False
+    return CountResult(int(cnt or 0), "LOCAL", reason=reason)
 
 
-async def live_pending_count(channel_id: Optional[int] = None) -> int:
+async def _local_pending_count(channel_id: Optional[int] = None) -> int:
     async with SessionLocal() as s:
         q = select(func.count()).select_from(JoinRequest).where(JoinRequest.status == "pending")
         if channel_id is not None:
             q = q.where(JoinRequest.channel_id == channel_id)
         return int((await s.execute(q)).scalar() or 0)
+
+
+async def live_pending_count(channel_id: int, use_ttl: bool = True) -> CountResult:
+    """Pending join requests. LIVE means we just listed them from Telegram AND
+    reconciled the DB (sync_channel_requests). Otherwise LOCAL, clearly labelled."""
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    cached = _pending_cache.get(channel_id)
+    if use_ttl and cached and (now - cached[1]).total_seconds() < CACHE_TTL_SECONDS:
+        return CountResult(cached[0], "LIVE", fetched_at=cached[1])
+
+    if await userbot_ready():
+        n, err = await sync_channel_requests(channel_id)
+        if err is None:
+            _pending_cache[channel_id] = (n, now)
+            return CountResult(n, "LIVE", fetched_at=now)
+        local = await _local_pending_count(channel_id)
+        if cached:
+            return CountResult(cached[0], "CACHED", reason=err, fetched_at=cached[1])
+        return CountResult(local, "LOCAL", reason=err)
+
+    local = await _local_pending_count(channel_id)
+    return CountResult(local, "LOCAL", reason="userbot not connected")
+
+
+def src_tag(r: CountResult) -> str:
+    """Short label appended to any dashboard number."""
+    if r.source == "LIVE":
+        return ""
+    if r.source == "CACHED":
+        age = ""
+        if r.fetched_at:
+            secs = int((now_utc() - r.fetched_at).total_seconds())
+            age = f" {secs // 60}m old" if secs >= 60 else f" {secs}s old"
+        return f" ⚠️ cached{age}"
+    return " ⚠️ local DB only"
 
 
 def fmt_uptime() -> str:
@@ -1522,6 +1996,19 @@ def fmt_uptime() -> str:
 # MAIN PANEL TEXT
 # ===========================================================================
 
+_tg_sem = asyncio.Semaphore(4)      # cap concurrent Telegram lookups (respect rate limits)
+
+
+async def _gather_channel_stats(channels: list, refresh: bool):
+    """Fetch member + pending counts for all channels with bounded concurrency."""
+    async def one(ch):
+        async with _tg_sem:
+            members = await live_member_count(ch.channel_id, use_ttl=not refresh)
+            pending = await live_pending_count(ch.channel_id, use_ttl=not refresh)
+        return ch, members, pending
+    return await asyncio.gather(*(one(c) for c in channels), return_exceptions=False)
+
+
 async def build_main_panel_text(sync: bool = False) -> str:
     logged_in = await userbot_ready()
     userbot_status = "🟢 Connected" if logged_in else "🔴 Not logged in"
@@ -1530,38 +2017,38 @@ async def build_main_panel_text(sync: bool = False) -> str:
         try:
             me = await userbot.get_me()
             userbot_info = f" as {esc('@' + me.username) if me.username else esc(me.first_name)}"
-        except Exception:
-            pass
-        if sync:
-            try:
-                await sync_pending_with_telegram()
-            except Exception as exc:
-                logger.warning("sync_pending failed: %s", exc)
+        except Exception as exc:
+            logger.warning("panel: userbot.get_me failed: %s", exc)
 
     async with SessionLocal() as session:
         channels = (await session.execute(
             select(Channel).where(Channel.is_active == True))).scalars().all()  # noqa: E712
-        pending = (await session.execute(
-            select(func.count()).select_from(JoinRequest).where(JoinRequest.status == "pending"))).scalar()
         accepted_today = (await session.execute(
             select(func.count()).select_from(JoinRequest).where(
                 JoinRequest.status == "accepted", JoinRequest.processed_at >= today_start()))).scalar()
+        left_today = (await session.execute(
+            select(func.count()).select_from(MemberLeave).where(
+                MemberLeave.left_at >= today_start()))).scalar()
 
-    live_total, any_cached = 0, False
-    for ch in channels:
-        cnt, live = await live_member_count(ch.channel_id)
-        live_total += cnt
-        if not live:
-            any_cached = True
-    cached_note = " (cached)" if any_cached else ""
+    results = await _gather_channel_stats(channels, refresh=sync)
+    total_members = sum(m.value for _, m, _ in results)
+    total_pending = sum(p.value for _, _, p in results)
+    all_live_members = all(m.is_live for _, m, _ in results) if results else True
+    all_live_pending = all(p.is_live for _, _, p in results) if results else True
+
+    m_tag = "" if all_live_members else " ⚠️ some values cached/local"
+    p_tag = "" if all_live_pending else " ⚠️ live unavailable — showing cached data"
+    local_pending = await _local_pending_count()
 
     return (
         f"🤖 <b>Admin Panel</b>\n\n"
         f"🟢 Userbot: {userbot_status}{userbot_info}\n"
         f"📣 Channels: {len(channels)} managed\n"
-        f"👥 Live Members: {live_total:,}{cached_note}\n"
-        f"⏳ Pending Requests: {pending}\n"
+        f"👥 Members (Telegram): {total_members:,}{m_tag}\n"
+        f"⏳ Pending (Telegram): {total_pending}{p_tag}\n"
+        f"🗄 Pending (Local DB): {local_pending}\n"
         f"✅ Accepted Today: {accepted_today}\n"
+        f"🚪 Left Today: {left_today}\n"
         f"🚀 Bot Uptime: {fmt_uptime()}\n"
         f"🕒 Updated: {now_utc().strftime('%H:%M:%S')} UTC")
 
@@ -1582,7 +2069,7 @@ async def cmd_start(client: Client, message: Message):
 
     if is_admin(u.id):
         reset_flow(u.id)
-        panel_text = await build_main_panel_text(sync=True)
+        panel_text = await build_main_panel_text(sync=False)
         await message.reply_text(panel_text, reply_markup=kb_main_panel(await userbot_ready()),
                                  parse_mode=HTML)
     else:
@@ -1604,49 +2091,106 @@ async def cmd_channels(client: Client, message: Message):
     await show_channel_list(message.chat.id)
 
 
-async def show_channel_list(chat_id: int):
+async def build_channel_list(refresh: bool = False):
+    """Returns (text, markup). Each number is tagged when it is not LIVE."""
     async with SessionLocal() as session:
         channels = (await session.execute(
             select(Channel).where(Channel.is_active == True))).scalars().all()  # noqa: E712
     if not channels:
-        await bot.send_message(
-            chat_id, "No channels yet. Add the bot (and userbot) as admin to a channel to begin.",
-            reply_markup=kb_back())
-        return
+        return ("No channels yet. Add the bot (and userbot) as admin to a channel to begin.",
+                kb_back())
 
+    results = await _gather_channel_stats(channels, refresh=refresh)
     lines = ["📣 <b>Managed Channels</b>\n"]
     kb_rows = []
-    for i, ch in enumerate(channels, 1):
-        pending = await live_pending_count(ch.channel_id)
+    for i, (ch, members, pending) in enumerate(results, 1):
         async with SessionLocal() as session:
             s = await get_or_create_settings(session, ch.channel_id)
             auto_str = "ON" if s.auto_accept else "OFF"
-        cnt, live = await live_member_count(ch.channel_id)
-        note = "" if live else " (cached)"
-        lines.append(f"{i}. <b>{esc(ch.name)}</b>\n"
-                     f"   👥 Members: {cnt:,}{note}  ⏳ Pending: {pending}  ✅ Auto-Accept: {auto_str}")
-        kb_rows.append([InlineKeyboardButton(f"⚙️ Settings: {ch.name}"[:60],
+        lines.append(
+            f"{i}. <b>{esc(ch.name)}</b>\n"
+            f"   👥 Members: {members.value:,}{src_tag(members)}\n"
+            f"   ⏳ Pending: {pending.value}{src_tag(pending)}\n"
+            f"   ✅ Auto-Accept: {auto_str}")
+        kb_rows.append([InlineKeyboardButton(f"⚙️ {ch.name}"[:60],
                                              callback_data=f"channels:settings:{ch.channel_id}")])
-    kb_rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="channels:list")])
+    lines.append(f"\n🕒 Updated: {now_utc().strftime('%H:%M:%S')} UTC")
+    kb_rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="channels:refresh")])
     kb_rows.append([InlineKeyboardButton("« Back", callback_data="panel:main")])
-    await bot.send_message(chat_id, "\n".join(lines)[:4090],
-                           reply_markup=InlineKeyboardMarkup(kb_rows), parse_mode=HTML)
+    return "\n".join(lines)[:4090], InlineKeyboardMarkup(kb_rows)
+
+
+async def show_channel_list(chat_id: int, edit_msg: Optional[Message] = None, refresh: bool = False):
+    txt, kb = await build_channel_list(refresh=refresh)
+    if edit_msg is not None:
+        await safe_edit(edit_msg, txt, kb)
+    else:
+        await bot.send_message(chat_id, txt, reply_markup=kb, parse_mode=HTML)
+
+
+REQ_PAGE_SIZE = 8
+
+
+async def build_requests_overview():
+    """Per-channel LIVE pending/member counts + entry buttons."""
+    channels = await _active_channels()
+    if not channels:
+        return "No channels yet.", kb_back()
+    results = await _gather_channel_stats(channels, refresh=True)
+    lines = ["⏳ <b>Join Requests</b>\n"]
+    rows = []
+    for ch, members, pending in results:
+        lines.append(f"📣 <b>{esc(ch.name)}</b>\n"
+                     f"   ⏳ Pending (Telegram): {pending.value}{src_tag(pending)}\n"
+                     f"   👥 Members: {members.value:,}{src_tag(members)}\n")
+        rows.append([InlineKeyboardButton(f"👁 View Requests — {ch.name}"[:60],
+                                          callback_data=f"reqlist:{ch.channel_id}:1")])
+        rows.append([InlineKeyboardButton("✅ Accept All", callback_data=f"req:accept_all:{ch.channel_id}"),
+                     InlineKeyboardButton("❌ Decline All", callback_data=f"req:decline_all:{ch.channel_id}")])
+    lines.append(f"🕒 {now_utc().strftime('%H:%M:%S')} UTC")
+    rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="reqs:overview")])
+    rows.append([InlineKeyboardButton("« Back", callback_data="panel:main")])
+    return "\n".join(lines)[:4090], InlineKeyboardMarkup(rows)
+
+
+async def build_request_page(channel_id: int, page: int):
+    async with SessionLocal() as s:
+        total = (await s.execute(select(func.count()).select_from(JoinRequest).where(
+            JoinRequest.channel_id == channel_id, JoinRequest.status == "pending"))).scalar() or 0
+        pages = max(1, -(-total // REQ_PAGE_SIZE))
+        page = min(max(1, page), pages)
+        rows_ = (await s.execute(select(JoinRequest).where(
+            JoinRequest.channel_id == channel_id, JoinRequest.status == "pending"
+        ).order_by(JoinRequest.requested_at).offset((page - 1) * REQ_PAGE_SIZE)
+            .limit(REQ_PAGE_SIZE))).scalars().all()
+    name = await get_channel_name(channel_id)
+    if not rows_:
+        return (f"📣 <b>{esc(name)}</b>\n\nNo pending requests.",
+                InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh", callback_data=f"reqlist:{channel_id}:1")],
+                                      [InlineKeyboardButton("« Back", callback_data="reqs:overview")]]))
+    lines = [f"📣 <b>{esc(name)}</b> — pending {total}\n"]
+    kb = []
+    base = (page - 1) * REQ_PAGE_SIZE
+    for i, r in enumerate(rows_, 1):
+        uname = esc("@" + r.username) if r.username else "no username"
+        ago = now_utc() - (r.requested_at or now_utc())
+        mins = int(ago.total_seconds() // 60)
+        when = f"{mins} min ago" if mins < 60 else (f"{mins // 60} h ago" if mins < 1440 else f"{mins // 1440} d ago")
+        lines.append(f"<b>#{base + i}</b> 👤 {esc(r.first_name)} {esc(r.last_name or '')}\n"
+                     f"   {uname}\n   ID: <code>{r.user_id}</code>\n   Requested: {when}\n")
+        kb.append([InlineKeyboardButton(f"✅ #{base + i}", callback_data=f"jr:accept:{channel_id}:{r.user_id}"),
+                   InlineKeyboardButton(f"❌ #{base + i}", callback_data=f"jr:decline:{channel_id}:{r.user_id}"),
+                   InlineKeyboardButton(f"👁 #{base + i}", callback_data=f"user:profile:{channel_id}:{r.user_id}")])
+    kb.append(pager_row(f"reqlist:{channel_id}", page, pages))
+    kb.append([InlineKeyboardButton("🔄 Refresh", callback_data=f"reqlist:{channel_id}:{page}:r"),
+               InlineKeyboardButton("« Back", callback_data="reqs:overview")])
+    return "\n".join(lines)[:4090], InlineKeyboardMarkup(kb)
 
 
 async def cmd_requests(client: Client, message: Message):
-    async with SessionLocal() as session:
-        requests = (await session.execute(
-            select(JoinRequest).where(JoinRequest.status == "pending").limit(20))).scalars().all()
-    if not requests:
-        await message.reply_text("No pending requests.")
-        return
-    lines = ["<b>Pending Requests (up to 20):</b>\n"]
-    for r in requests:
-        uname = f"@{r.username}" if r.username else "(no username)"
-        lines.append(f"• {esc(r.first_name)} {esc(uname)} — <code>{r.user_id}</code> "
-                     f"in <code>{r.channel_id}</code>")
-    await message.reply_text("\n".join(lines), reply_markup=kb_main_panel(await userbot_ready()),
-                             parse_mode=HTML)
+    wait = await message.reply_text("🔄 Fetching live data from Telegram…")
+    txt, kb = await build_requests_overview()
+    await safe_edit(wait, txt, kb)
 
 
 async def cmd_accept_all(client: Client, message: Message):
@@ -1657,61 +2201,236 @@ async def cmd_decline_all(client: Client, message: Message):
     await bulk_process_requests(message.chat.id, None, approve=False)
 
 
-async def run_search(chat_id: int, query: str):
-    query = query.strip()
-    target_id: Optional[int] = None
-    target_username: Optional[str] = None
-    if query.lstrip("-").isdigit():
-        target_id = int(query)
+# ---------------------------------------------------------------------------
+# USER SEARCH  (channel-scoped, multi-result, live-verified)
+# ---------------------------------------------------------------------------
+
+STATUS_LABEL = {
+    "pending": "⏳ PENDING REQUEST", "member": "✅ MEMBER", "left": "🚪 LEFT",
+    "banned": "🔨 BANNED", "declined": "❌ DECLINED", "unknown": "❔ UNKNOWN",
+}
+
+
+async def live_user_status(channel_id: int, user_id: int):
+    """Ask Telegram for the user's CURRENT state in the channel.
+    Returns (status_key or None, error_or_None). None means 'could not verify'."""
+    if not await userbot_ready():
+        return None, "userbot not connected"
+    try:
+        m = await flood_safe(lambda: userbot.get_chat_member(channel_id, user_id))
+        st = m.status
+        if st in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR,
+                  ChatMemberStatus.OWNER, ChatMemberStatus.RESTRICTED):
+            return "member", None
+        if st == ChatMemberStatus.BANNED:
+            return "banned", None
+        if st == ChatMemberStatus.LEFT:
+            return "left", None
+        return None, f"unrecognised status {st}"
+    except Exception as exc:
+        name = type(exc).__name__
+        # Telegram says the user simply is not in the chat -> that IS a definite answer.
+        if "UserNotParticipant" in name or "USER_NOT_PARTICIPANT" in str(exc).upper():
+            return "left", None
+        return None, f"{name}"
+
+
+async def resolve_user_status(channel_id: int, user_id: int, verify: bool = True):
+    """Combine DB history with a live Telegram check. Telegram wins when it answers.
+    Returns dict with status, source ('LIVE'|'LOCAL'), verify_error, and DB rows."""
+    async with SessionLocal() as s:
+        pending = (await s.execute(select(JoinRequest).where(
+            JoinRequest.channel_id == channel_id, JoinRequest.user_id == user_id,
+            JoinRequest.status == "pending"))).scalars().first()
+        last_req = (await s.execute(select(JoinRequest).where(
+            JoinRequest.channel_id == channel_id, JoinRequest.user_id == user_id
+        ).order_by(JoinRequest.id.desc()))).scalars().first()
+        mem = (await s.execute(select(Member).where(
+            Member.channel_id == channel_id, Member.user_id == user_id))).scalars().first()
+
+    # local guess from history
+    if pending:
+        local = "pending"
+    elif mem and mem.is_active:
+        local = "member"
+    elif mem and not mem.is_active:
+        local = "left"
+    elif last_req and last_req.status == "declined":
+        local = "declined"
     else:
-        target_username = query.lstrip("@")
+        local = "unknown"
 
-    async with SessionLocal() as session:
-        if target_id is not None:
-            jr = (await session.execute(select(JoinRequest).where(
-                JoinRequest.user_id == target_id, JoinRequest.status == "pending"))).scalars().first()
-            mem = (await session.execute(select(Member).where(
-                Member.user_id == target_id, Member.is_active == True))).scalars().first()  # noqa: E712
+    status, source, verr = local, "LOCAL", None
+    if verify:
+        live, verr = await live_user_status(channel_id, user_id)
+        if live is not None:
+            source = "LIVE"
+            if live == "member":
+                status = "member"
+                if mem is None or not mem.is_active:      # reconcile DB with Telegram
+                    await record_member(channel_id, user_id,
+                                        (mem.first_name if mem else "") or (last_req.first_name if last_req else ""),
+                                        (mem.username if mem else "") or (last_req.username if last_req else ""))
+            elif live in ("banned", "left"):
+                # A live 'left' with a genuine pending request stays PENDING (requesters aren't members).
+                status = "pending" if (pending and live == "left") else live
+                if mem and mem.is_active:
+                    await deactivate_member(channel_id, user_id)
+    return {"status": status, "source": source, "verify_error": verr,
+            "pending": pending, "last_req": last_req, "member": mem}
+
+
+def _fmt_dt(dt) -> str:
+    return dt.strftime("%Y-%m-%d %H:%M") + " UTC" if dt else "—"
+
+
+async def find_users(query: str, channel_id: Optional[int], limit: int = 50):
+    """Local search across members + join requests. Returns list of
+    (channel_id, user_id, first_name, last_name, username), de-duplicated."""
+    q = query.strip()
+    found: dict = {}
+
+    def add(ch, uid, fn, ln, un):
+        key = (ch, uid)
+        if key not in found:
+            found[key] = (ch, uid, fn or "", ln or "", un or "")
+
+    async with SessionLocal() as s:
+        if q.lstrip("-").isdigit():
+            uid = int(q)
+            conds_m = [Member.user_id == uid]
+            conds_j = [JoinRequest.user_id == uid]
         else:
-            jr = (await session.execute(select(JoinRequest).where(
-                func.lower(JoinRequest.username) == target_username.lower(),
-                JoinRequest.status == "pending"))).scalars().first()
-            mem = (await session.execute(select(Member).where(
-                func.lower(Member.username) == target_username.lower(),
-                Member.is_active == True))).scalars().first()  # noqa: E712
+            term = q.lstrip("@").lower()
+            like = f"%{term}%"
+            conds_m = [or_(func.lower(Member.username).like(like),
+                           func.lower(Member.first_name).like(like),
+                           func.lower(func.coalesce(Member.last_name, "")).like(like))]
+            conds_j = [or_(func.lower(JoinRequest.username).like(like),
+                           func.lower(JoinRequest.first_name).like(like),
+                           func.lower(func.coalesce(JoinRequest.last_name, "")).like(like))]
+        mq = select(Member).where(*conds_m)
+        jq = select(JoinRequest).where(*conds_j)
+        if channel_id is not None:
+            mq = mq.where(Member.channel_id == channel_id)
+            jq = jq.where(JoinRequest.channel_id == channel_id)
+        for m in (await s.execute(mq.limit(limit))).scalars().all():
+            add(m.channel_id, m.user_id, m.first_name, m.last_name, m.username)
+        for j in (await s.execute(jq.order_by(JoinRequest.id.desc()).limit(limit))).scalars().all():
+            add(j.channel_id, j.user_id, j.first_name, j.last_name, j.username)
+    return list(found.values())[:limit]
 
-    if jr is None and mem is None:
-        if not await userbot_ready():
-            await bot.send_message(chat_id, "❌ No local record found, and userbot isn't logged in "
-                                            "for a live lookup.", reply_markup=kb_back())
-            return
+
+async def build_user_profile(channel_id: int, user_id: int):
+    """Returns (html_text, markup) for a full profile in one channel, with live verification."""
+    info = await resolve_user_status(channel_id, user_id, verify=True)
+    st, mem, pend, last_req = info["status"], info["member"], info["pending"], info["last_req"]
+    name_src = mem or pend or last_req
+    fn = (name_src.first_name if name_src else "") or ""
+    ln = (getattr(name_src, "last_name", "") if name_src else "") or ""
+    un = (name_src.username if name_src else "") or ""
+    if not fn and await userbot_ready():
         try:
-            lookup = target_id if target_id is not None else target_username
-            u = await userbot.get_users(lookup)
-            txt = (f"<b>User found (live lookup)</b>\n"
-                   f"Name: {esc(u.first_name)} {esc(u.last_name)}\n"
-                   f"Username: {esc('@' + u.username) if u.username else '(none)'}\n"
-                   f"ID: <code>{u.id}</code>\nStatus: Not tracked locally")
-            await bot.send_message(chat_id, txt, reply_markup=kb_user_actions(u.id, False, False),
-                                   parse_mode=HTML)
-        except (PeerIdInvalid, UsernameNotOccupied, IndexError, KeyError):
-            await bot.send_message(chat_id, "❌ No user found matching that ID or username.",
-                                   reply_markup=kb_back())
+            u = await userbot.get_users(user_id)
+            fn, ln, un = u.first_name or "", u.last_name or "", u.username or ""
         except Exception as exc:
-            logger.warning("Search lookup failed: %s", exc)
-            await bot.send_message(chat_id, f"❌ Lookup failed: {esc(exc)}", reply_markup=kb_back(),
-                                   parse_mode=HTML)
+            logger.info("profile: get_users(%s) failed: %s", user_id, type(exc).__name__)
+
+    async with SessionLocal() as s:
+        blocked = (await s.execute(select(BlockedUser).where(BlockedUser.user_id == user_id))).scalar_one_or_none()
+        msgs = (await s.execute(select(func.count()).select_from(Conversation).where(
+            Conversation.user_id == user_id))).scalar()
+    chan = await get_channel_name(channel_id)
+    if info["source"] == "LIVE":
+        src_line = "🟢 Source: LIVE (verified with Telegram)"
+    else:
+        why = f" — {esc(info['verify_error'])}" if info["verify_error"] else ""
+        src_line = f"⚠️ Source: LOCAL DB only, live check failed{why}"
+
+    txt = (f"👤 <b>USER PROFILE</b>\n\n"
+           f"Name: {esc((fn + ' ' + ln).strip() or '(unknown)')}\n"
+           f"Username: {esc('@' + un) if un else '(none)'}\n"
+           f"ID: <code>{user_id}</code>\n\n"
+           f"📣 Channel: {esc(chan)}\n"
+           f"Current Status: <b>{STATUS_LABEL[st]}</b>\n{src_line}\n\n"
+           f"🕒 First Joined: {_fmt_dt(mem.first_joined_at or mem.joined_at) if mem else '—'}\n"
+           f"🕒 Last Joined: {_fmt_dt(mem.last_joined_at) if mem else '—'}\n"
+           f"🕒 Last Left: {_fmt_dt(mem.last_left_at) if mem else '—'}\n"
+           f"⏳ Pending Request: {'Yes — since ' + _fmt_dt(pend.requested_at) if pend else 'No'}\n"
+           f"📅 Last Request: {(last_req.status + ' ' + _fmt_dt(last_req.requested_at)) if last_req else '—'}\n\n"
+           f"📨 Messages: {msgs}\n🚫 Blocked: {'Yes' if blocked else 'No'}")
+
+    rows = []
+    if st == "pending":
+        rows.append([InlineKeyboardButton("✅ Accept", callback_data=f"jr:accept:{channel_id}:{user_id}"),
+                     InlineKeyboardButton("❌ Decline", callback_data=f"jr:decline:{channel_id}:{user_id}")])
+    if st == "member":
+        rows.append([InlineKeyboardButton("🚫 Remove", callback_data=f"user:remove:{user_id}:{channel_id}"),
+                     InlineKeyboardButton("🔇 Mute", callback_data=f"user:mute:{user_id}:{channel_id}"),
+                     InlineKeyboardButton("🔨 Ban", callback_data=f"user:ban:{user_id}:{channel_id}")])
+    if st == "banned":
+        rows.append([InlineKeyboardButton("♻️ Unban", callback_data=f"user:unban:{user_id}:{channel_id}")])
+    rows.append([InlineKeyboardButton("🔄 Refresh Status", callback_data=f"user:profile:{channel_id}:{user_id}")])
+    rows.append([InlineKeyboardButton("📥 Open Inbox", callback_data=f"inbox:open:{user_id}"),
+                 InlineKeyboardButton("« Back", callback_data="panel:main")])
+    return txt, InlineKeyboardMarkup(rows)
+
+
+async def run_search(chat_id: int, query: str, channel_id: Optional[int] = None):
+    """Search by ID / @username / partial username / name, optionally within one channel."""
+    query = query.strip()
+    if not query:
+        await bot.send_message(chat_id, "Send a user ID, @username or a name.", reply_markup=kb_back())
+        return
+    logger.info("search query_len=%d channel_id=%s", len(query), channel_id)
+    results = await find_users(query, channel_id)
+
+    # Nothing local -> try a live Telegram lookup so brand-new users are still found.
+    if not results and await userbot_ready():
+        try:
+            lookup = int(query) if query.lstrip("-").isdigit() else query.lstrip("@")
+            u = await userbot.get_users(lookup)
+            targets = ([channel_id] if channel_id is not None else
+                       [c.channel_id for c in await _active_channels()])
+            for ch in targets:
+                results.append((ch, u.id, u.first_name or "", u.last_name or "", u.username or ""))
+        except (PeerIdInvalid, UsernameNotOccupied, KeyError, IndexError):
+            pass
+        except Exception as exc:
+            logger.warning("search live lookup failed: %s: %s", type(exc).__name__, exc)
+            await bot.send_message(chat_id, f"❌ Live lookup failed: {esc(type(exc).__name__)}",
+                                   reply_markup=kb_back(), parse_mode=HTML)
+            return
+
+    if not results:
+        scope = f" in <b>{esc(await get_channel_name(channel_id))}</b>" if channel_id is not None else ""
+        await bot.send_message(chat_id, f"❌ No user found matching <code>{esc(query)}</code>{scope}.",
+                               reply_markup=kb_back(), parse_mode=HTML)
         return
 
-    uid = jr.user_id if jr else mem.user_id
-    name = jr.first_name if jr else (mem.first_name or str(uid))
-    uname_src = jr.username if jr else (mem.username if mem else "")
-    uname = f"@{uname_src}" if uname_src else "(no username)"
-    status = "Pending" if jr else "Member"
-    txt = (f"<b>User Profile</b>\n\nName: {esc(name)}\nUsername: {esc(uname)}\n"
-           f"ID: <code>{uid}</code>\nStatus: {status}")
-    await bot.send_message(chat_id, txt, reply_markup=kb_user_actions(uid, jr is not None, mem is not None),
+    if len(results) == 1:
+        ch, uid, *_ = results[0]
+        txt, kb = await build_user_profile(ch, uid)
+        await bot.send_message(chat_id, txt, reply_markup=kb, parse_mode=HTML)
+        return
+
+    lines = [f"🔍 <b>{len(results)} match(es)</b> for <code>{esc(query)}</code>\n"]
+    btns = []
+    for ch, uid, fn, ln, un in results[:20]:
+        label = f"{(fn + ' ' + ln).strip() or uid}" + (f" @{un}" if un else "")
+        cname = await get_channel_name(ch)
+        btns.append([InlineKeyboardButton(f"{label} · {cname}"[:60],
+                                          callback_data=f"user:profile:{ch}:{uid}")])
+    if len(results) > 20:
+        lines.append(f"Showing first 20 of {len(results)} — narrow your search.")
+    btns.append([InlineKeyboardButton("« Back", callback_data="panel:main")])
+    await bot.send_message(chat_id, "\n".join(lines), reply_markup=InlineKeyboardMarkup(btns),
                            parse_mode=HTML)
+
+
+async def _active_channels() -> list:
+    async with SessionLocal() as s:
+        return (await s.execute(select(Channel).where(Channel.is_active == True))).scalars().all()  # noqa: E712
 
 
 async def cmd_search(client: Client, message: Message):
@@ -1787,7 +2506,7 @@ async def cmd_broadcast(client: Client, message: Message):
         reply_markup=kb_back())
 
 
-async def build_stats_text() -> str:
+async def build_stats_text(refresh: bool = False) -> str:
     async with SessionLocal() as session:
         channels = (await session.execute(
             select(Channel).where(Channel.is_active == True))).scalars().all()  # noqa: E712
@@ -1805,28 +2524,31 @@ async def build_stats_text() -> str:
             me = await userbot.get_me()
             userbot_info = (f" as {esc('@' + me.username) if me.username else esc(me.first_name)} "
                             f"(ID: <code>{me.id}</code>)")
-        except Exception:
-            pass
-        try:
-            await sync_pending_with_telegram()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("stats: userbot.get_me failed: %s", exc)
 
+    results = await _gather_channel_stats(channels, refresh=refresh)
     ts = today_start()
     blocks = []
-    for ch in channels:
+    for ch, members, pending in results:
         async with SessionLocal() as session:
-            ch_pending = (await session.execute(select(func.count()).select_from(JoinRequest).where(
-                JoinRequest.channel_id == ch.channel_id, JoinRequest.status == "pending"))).scalar()
+            # "Joined today" = members whose LATEST join is today (covers rejoins too)
             joined_today = (await session.execute(select(func.count()).select_from(Member).where(
-                Member.channel_id == ch.channel_id, Member.joined_at >= ts))).scalar()
+                Member.channel_id == ch.channel_id,
+                func.coalesce(Member.last_joined_at, Member.joined_at) >= ts))).scalar()
             left_today = (await session.execute(select(func.count()).select_from(MemberLeave).where(
                 MemberLeave.channel_id == ch.channel_id, MemberLeave.left_at >= ts))).scalar()
-        cnt, live = await live_member_count(ch.channel_id)
-        note = "" if live else " (cached)"
-        blocks.append(f"📣 <b>{esc(ch.name)}</b>\n  👥 Live Members: {cnt:,}{note}\n"
-                      f"  ⏳ Pending Requests: {ch_pending}\n  ✅ Joined Today: {joined_today}\n"
-                      f"  🚪 Left Today: {left_today}")
+            tracked = (await session.execute(select(func.count()).select_from(Member).where(
+                Member.channel_id == ch.channel_id, Member.is_active == True))).scalar()  # noqa: E712
+            local_pending = await _local_pending_count(ch.channel_id)
+        blocks.append(
+            f"📣 <b>{esc(ch.name)}</b>\n"
+            f"  👥 Members (Telegram): {members.value:,}{src_tag(members)}\n"
+            f"  ⏳ Pending (Telegram): {pending.value}{src_tag(pending)}\n"
+            f"  🗄 Pending (Local DB): {local_pending}\n"
+            f"  🧾 Tracked active members: {tracked}\n"
+            f"  ✅ Joined Today: {joined_today}\n"
+            f"  🚪 Left Today: {left_today}")
     ch_section = "\n\n".join(blocks) if blocks else "(no channels)"
 
     return (f"<b>📊 Statistics</b>\n\n🤖 Userbot: {userbot_status_txt}{userbot_info}\n"
@@ -2045,8 +2767,8 @@ async def handle_admin_message(client: Client, message: Message, uid: int):
                 try:
                     u = await bot.get_users(target_id)
                     name = u.first_name or ""
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.info("add_admin: could not resolve name for %s (%s)", target_id, type(exc).__name__)
                 session.add(Admin(user_id=target_id, name=name))
                 await session.commit()
                 await reload_admins()
@@ -2061,8 +2783,9 @@ async def handle_admin_message(client: Client, message: Message, uid: int):
     if st == St.SEARCH:
         if not txt:
             return
+        scope = f.data.get("search_channel")
         reset_flow(uid)
-        await run_search(chat_id, txt)
+        await run_search(chat_id, txt, scope)
         return
 
     # ---- broadcast content ----
@@ -2459,8 +3182,24 @@ async def on_callback(client: Client, cq: CallbackQuery):
         elif data in ("panel:main", "panel:refresh"):
             await ack("Refreshing…" if data == "panel:refresh" else "")
             reset_flow(admin_id)
-            panel_text = await build_main_panel_text(sync=True)
+            panel_text = await build_main_panel_text(sync=(data == "panel:refresh"))
             await safe_edit(cq.message, panel_text, kb_main_panel(await userbot_ready()))
+
+        elif data == "reqs:overview":
+            await ack("Refreshing…")
+            txt, kb = await build_requests_overview()
+            await safe_edit(cq.message, txt, kb)
+
+        elif p[0] == "reqlist" and len(p) >= 3:
+            ch_id, page = int(p[1]), int(p[2])
+            force = len(p) >= 4 and p[3] == "r"
+            await ack("Syncing…" if force else "")
+            if force:
+                _, err = await sync_channel_requests(ch_id)
+                if err:
+                    logger.info("reqlist refresh sync error ch=%s: %s", ch_id, err)
+            txt, kb = await build_request_page(ch_id, page)
+            await safe_edit(cq.message, txt, kb)
 
         # ---- accept / decline all ----
         elif data.startswith("req:accept_all") or data.startswith("req:decline_all"):
@@ -2473,13 +3212,32 @@ async def on_callback(client: Client, cq: CallbackQuery):
         elif data == "search:start":
             await ack()
             reset_flow(admin_id)
-            flow(admin_id).state = St.SEARCH
-            await safe_edit(cq.message, "Send a User ID or @username to search.", kb_back())
+            channels = await _active_channels()
+            rows = [[InlineKeyboardButton("🌐 All Channels", callback_data="search:scope:all")]]
+            for c in channels:
+                rows.append([InlineKeyboardButton(f"📣 {c.name or c.channel_id}"[:60],
+                                                  callback_data=f"search:scope:{c.channel_id}")])
+            rows.append([InlineKeyboardButton("« Back", callback_data="panel:main")])
+            await safe_edit(cq.message, "🔍 <b>Search User</b>\n\nWhere do you want to search?",
+                            InlineKeyboardMarkup(rows))
+
+        elif data.startswith("search:scope:"):
+            await ack()
+            reset_flow(admin_id)
+            f = flow(admin_id)
+            f.state = St.SEARCH
+            f.data["search_channel"] = None if p[2] == "all" else int(p[2])
+            scope = ("all channels" if p[2] == "all"
+                     else f"<b>{esc(await get_channel_name(int(p[2])))}</b>")
+            await safe_edit(
+                cq.message,
+                f"🔍 Searching in {scope}.\n\nSend a <b>user ID</b>, <b>@username</b>, or part of a "
+                f"<b>name</b>:", kb_back("search:start"))
 
         # ---- channels ----
-        elif data == "channels:list":
-            await ack()
-            await show_channel_list(chat_id)
+        elif data in ("channels:list", "channels:refresh"):
+            await ack("Refreshing…" if data == "channels:refresh" else "")
+            await show_channel_list(chat_id, edit_msg=cq.message, refresh=(data == "channels:refresh"))
 
         elif data.startswith("channels:settings:"):
             await ack()
@@ -2507,7 +3265,7 @@ async def on_callback(client: Client, cq: CallbackQuery):
         # ---- stats ----
         elif data in ("stats:show", "stats:refresh"):
             await ack("Loading…")
-            txt = await build_stats_text()
+            txt = await build_stats_text(refresh=(data == "stats:refresh"))
             if data == "stats:refresh":
                 await safe_edit(cq.message, txt, KB_STATS)
             else:
@@ -2787,79 +3545,111 @@ async def on_callback(client: Client, cq: CallbackQuery):
                                             f"(text, photo, voice, etc.):", parse_mode=HTML)
 
         # ---- user actions ----
+        # ---- per-request actions (channel-scoped: fixes acting on the wrong channel) ----
+        elif p[0] == "jr" and len(p) >= 4:
+            action, ch_id, target_id = p[1], int(p[2]), int(p[3])
+            if action in ("accept", "decline"):
+                approve = action == "accept"
+                if not await userbot_ready():
+                    await ack("Userbot not logged in.", True)
+                    return
+                await ack("Processing…")
+                outcome = await apply_request_decision(ch_id, target_id, approve)
+                await safe_edit(cq.message, outcome, kb_back())
+            elif action == "refresh":
+                await ack("Refreshing…")
+                pending = await live_pending_count(ch_id, use_ttl=False)
+                members = await live_member_count(ch_id, use_ttl=False)
+                async with SessionLocal() as session:
+                    jr = (await session.execute(select(JoinRequest).where(
+                        JoinRequest.channel_id == ch_id, JoinRequest.user_id == target_id,
+                        JoinRequest.status == "pending"))).scalars().first()
+                state = "⏳ Still pending" if jr else "✔️ No longer pending"
+                await safe_edit(
+                    cq.message,
+                    f"🔔 <b>Join request</b>\n\nChannel: <b>{esc(await get_channel_name(ch_id))}</b>\n"
+                    f"User ID: <code>{target_id}</code>\nStatus: {state}\n\n"
+                    f"⏳ Pending (Telegram): {pending.value}{src_tag(pending)}\n"
+                    f"👥 Members: {members.value:,}{src_tag(members)}\n"
+                    f"🕒 {now_utc().strftime('%H:%M:%S')} UTC",
+                    kb_join_request_actions(ch_id, target_id) if jr else kb_back())
+            else:
+                await ack()
+
         elif data.startswith("user:accept:") or data.startswith("user:decline:"):
+            # Legacy 3-part callback (old messages still in chats). Resolve the channel from
+            # the pending rows; if the user is pending in several, ask instead of guessing.
             target_id = int(p[2])
             approve = p[1] == "accept"
             if not await userbot_ready():
                 await ack("Userbot not logged in.", True)
                 return
             async with SessionLocal() as session:
-                jr = (await session.execute(select(JoinRequest).where(
-                    JoinRequest.user_id == target_id, JoinRequest.status == "pending"))).scalars().first()
-            if jr is None:
+                rows = (await session.execute(select(JoinRequest).where(
+                    JoinRequest.user_id == target_id, JoinRequest.status == "pending"))).scalars().all()
+            if not rows:
                 await ack("No pending request found.", True)
                 return
-            result = await process_join_request(jr.channel_id, jr.user_id, approve)
-            if result in ("ok", "gone"):
-                async with SessionLocal() as session:
-                    row = (await session.execute(select(JoinRequest).where(JoinRequest.id == jr.id))).scalar_one()
-                    row.status = ("accepted" if approve else "declined") if result == "ok" else "expired"
-                    row.processed_at = now_utc()
-                    await session.commit()
-                if approve and result == "ok":
-                    await record_member(jr.channel_id, jr.user_id, jr.first_name, jr.username)
-                    await send_join_message(jr.channel_id, await get_channel_name(jr.channel_id),
-                                            jr.user_id, jr.first_name, jr.last_name or "", jr.username)
-                await ack("Done.")
-                await safe_edit(cq.message, f"{'✅ Accepted' if approve else '❌ Declined'} "
-                                            f"user <code>{target_id}</code>.", kb_back())
-            else:
-                await ack("Failed — check the userbot is admin with invite permission.", True)
+            if len(rows) > 1:
+                await ack()
+                btns = [[InlineKeyboardButton(
+                    f"{'✅' if approve else '❌'} {await get_channel_name(r.channel_id)}"[:60],
+                    callback_data=f"jr:{p[1]}:{r.channel_id}:{target_id}")] for r in rows]
+                btns.append([InlineKeyboardButton("« Back", callback_data="panel:main")])
+                await safe_edit(cq.message, "This user has requests in several channels. Pick one:",
+                                InlineKeyboardMarkup(btns))
+                return
+            await ack("Processing…")
+            outcome = await apply_request_decision(rows[0].channel_id, target_id, approve)
+            await safe_edit(cq.message, outcome, kb_back())
 
-        elif p[0] == "user" and p[1] in ("remove", "ban", "mute"):
-            target_id, action = int(p[2]), p[1]
+        elif p[0] == "user" and p[1] in ("remove", "ban", "mute", "unban") and len(p) >= 4:
+            target_id, ch_id, action = int(p[2]), int(p[3]), p[1]
             if not await userbot_ready():
                 await ack("Userbot not logged in.", True)
                 return
-            async with SessionLocal() as session:
-                mem = (await session.execute(select(Member).where(
-                    Member.user_id == target_id, Member.is_active == True))).scalars().first()  # noqa: E712
-            if mem is None:
-                await ack("User not tracked as a member.", True)
-                return
             try:
                 if action == "remove":
-                    await userbot.ban_chat_member(mem.channel_id, target_id)
-                    await userbot.unban_chat_member(mem.channel_id, target_id)
-                    await deactivate_member(mem.channel_id, target_id)
+                    await userbot.ban_chat_member(ch_id, target_id)
+                    await userbot.unban_chat_member(ch_id, target_id)
+                    await deactivate_member(ch_id, target_id)
                 elif action == "ban":
-                    await userbot.ban_chat_member(mem.channel_id, target_id)
-                    await deactivate_member(mem.channel_id, target_id)
+                    await userbot.ban_chat_member(ch_id, target_id)
+                    await deactivate_member(ch_id, target_id)
+                elif action == "unban":
+                    await userbot.unban_chat_member(ch_id, target_id)
                 else:
-                    await userbot.restrict_chat_member(mem.channel_id, target_id, ChatPermissions())
-                await ack(f"{action.capitalize()} applied.")
-                await safe_edit(cq.message, f"✅ {action.capitalize()} applied to <code>{target_id}</code>.",
-                                kb_back())
+                    await userbot.restrict_chat_member(ch_id, target_id, ChatPermissions())
             except Exception as exc:
-                await ack(f"Failed: {str(exc)[:150]}", True)
+                logger.warning("user action %s failed ch=%s user=%s: %s: %s",
+                               action, ch_id, target_id, type(exc).__name__, exc)
+                await ack(f"Failed: {type(exc).__name__} — check userbot admin rights.", True)
+                return
+            _member_cache.pop(ch_id, None)
+            logger.info("user_action %s channel_id=%s user_id=%s admin_id=%s",
+                        action, ch_id, target_id, admin_id)
+            await ack(f"{action.capitalize()} applied.")
+            txt, kb = await build_user_profile(ch_id, target_id)
+            await safe_edit(cq.message, txt, kb)
 
         elif data.startswith("user:profile:"):
-            target_id = int(p[2])
-            try:
-                u = await bot.get_users(target_id)
-            except Exception:
-                try:
-                    u = await userbot.get_users(target_id) if await userbot_ready() else None
-                except Exception:
-                    u = None
-            if u is None:
-                await ack("Lookup failed.", True)
-                return
-            await ack()
-            await safe_edit(cq.message,
-                            f"<b>Profile</b>\nName: {esc(u.first_name)} {esc(u.last_name)}\n"
-                            f"Username: {esc('@' + u.username) if u.username else '(none)'}\n"
-                            f"ID: <code>{u.id}</code>", kb_back())
+            # new format user:profile:<channel_id>:<user_id>; legacy user:profile:<user_id>
+            await ack("Checking Telegram…")
+            if len(p) >= 4:
+                ch_id, target_id = int(p[2]), int(p[3])
+            else:
+                target_id = int(p[2])
+                async with SessionLocal() as session:
+                    hit = (await session.execute(select(Member.channel_id).where(
+                        Member.user_id == target_id).limit(1))).first() or \
+                          (await session.execute(select(JoinRequest.channel_id).where(
+                              JoinRequest.user_id == target_id).limit(1))).first()
+                if not hit:
+                    await safe_edit(cq.message, "No channel record for that user.", kb_back())
+                    return
+                ch_id = hit[0]
+            txt, kb = await build_user_profile(ch_id, target_id)
+            await safe_edit(cq.message, txt, kb)
 
         # ---- broadcast confirm / schedule ----
         elif data == "confirm:broadcast_send":
@@ -2960,7 +3750,7 @@ async def on_callback(client: Client, cq: CallbackQuery):
         logger.exception("Callback failed for data=%s: %s", data, exc)
         await ack("Something went wrong — check logs.", True)
     finally:
-        await ack()  # guarantees the button spinner always stops
+        await ack()  # no-op if a branch already answered; otherwise stops the spinner
 
 
 # ===========================================================================
@@ -3012,11 +3802,10 @@ async def bootstrap_owner():
 async def periodic_sync():
     """Every 10 min reconcile DB-pending with Telegram so the panel stays truthful."""
     try:
-        n = await sync_pending_with_telegram()
-        if n:
-            logger.info("periodic_sync corrected %d row(s)", n)
+        ok = await sync_pending_with_telegram()
+        logger.info("periodic_sync reconciled %d channel(s)", ok)
     except Exception as exc:
-        logger.warning("periodic_sync failed: %s", exc)
+        logger.exception("periodic_sync failed: %s", exc)
 
 
 async def main():
@@ -3056,11 +3845,10 @@ async def main():
     if await start_userbot_from_kv():
         logger.info("Userbot restored from saved session.")
         try:
-            fixed = await sync_pending_with_telegram()
-            if fixed:
-                logger.info("Startup sync corrected %d pending row(s).", fixed)
+            ok = await sync_pending_with_telegram()
+            logger.info("Startup sync reconciled %d channel(s).", ok)
         except Exception as exc:
-            logger.warning("Startup sync failed: %s", exc)
+            logger.exception("Startup sync failed: %s", exc)
     else:
         logger.info("No valid userbot session — use 🔐 Userbot Login in the admin panel.")
 
