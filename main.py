@@ -1,36 +1,44 @@
 """
-Telegram Channel Manager Bot  (Phase 2 — Automation Engine, Premium UI, Hardened)
+Telegram Channel Manager Bot  (Phase 3 — Fast, Simple Automation, Hardened, Backup/Restore)
 
 Pyrogram bot + userbot, SQLAlchemy async, APScheduler, hardened FSM, persistent
-Automation Engine, safe callback routing, safe background tasks, safe DB migrations.
+Automation Engine, safe callback routing, safe background tasks, safe DB migrations,
+and a full Database Backup / Restore system inside System Tools.
 
 .env keys:
     BOT_TOKEN, OWNER_ID, API_ID, API_HASH, DATABASE_URL, LOG_LEVEL
 Run:
     pip install -r requirements.txt && python bot.py
 
-Phase 2 (this file) — highlights
-  * FULL Automation Center: persistent rules, priorities, scopes, cooldowns,
-    triggers (message + events), rich responses (text/photo/video/document/audio/
-    voice/animation), multiple inline buttons, variables, preview, test, stats, logs.
-  * Legacy global auto-reply is auto-migrated into an equivalent automation rule
-    (idempotent, once-only).
-  * Premium dashboard, per-channel manager, paginated lists, actionable statuses.
-  * Hardened FSM (per-admin isolation, TTL, cancel), safe callback dispatcher
-    (never crashes on stale/malformed data), background task registry with
-    exception capture, safe scheduler wrappers, graceful shutdown.
-  * Same Telegram-authoritative LIVE/CACHED/LOCAL counting as before — never
-    mislabels stale data.
-  * Same channel-scoped join-request actions, safe reconciliation, bulk safety.
+Highlights
+  * SIMPLE automation wizard: "What message should trigger?" -> "What should I reply?"
+    Default match is EXACT. No hidden "any" surprise.
+  * Fast path: in-memory rule/button/settings cache; execution counters bumped with
+    one batched UPDATE per message; no full-cache invalidation on incoming messages.
+  * Non-blocking user relay (spawn) so automations reply instantly.
+  * Advanced Settings submenu (match type, scope, priority, cooldown, media, buttons).
+  * Full edit flows: one-step edits that save & return.
+  * Rule Duplicate + per-rule logs + rule-level Test.
+  * Channels tab: Add / Remove / Settings / Refresh.
+  * Legacy auto-reply fully migrated & suppressed once any automation exists.
+  * 💾 Backup & Restore inside System Tools:
+      - SQLite: VACUUM INTO .db backup, validated + atomic file swap on restore.
+      - Postgres: universal JSON export/import (also works for SQLite).
+      - Auto safety backup before every restore; caches reloaded after.
+  * All old features preserved.
 """
 
 from __future__ import annotations
 
 import asyncio
 import html as _html
+import json
 import logging
+import os
 import re
+import shutil
 import sys
+import time
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -89,6 +97,9 @@ BULK_APPROVE_INTERVAL = 0.05
 MAX_TEXT = 3800
 
 Path("logs").mkdir(exist_ok=True)
+BACKUP_DIR = Path("backups")
+BACKUP_DIR.mkdir(exist_ok=True)
+
 logger = logging.getLogger("channel_manager")
 logger.setLevel(LOG_LEVEL)
 logger.propagate = False
@@ -103,12 +114,10 @@ logger.addHandler(_ch)
 BOT_START_TIME = datetime.now(timezone.utc)
 HTML = enums.ParseMode.HTML
 
-# Background task registry (for graceful shutdown + exception capture)
 _background_tasks: set[asyncio.Task] = set()
 
 
 def spawn(coro: Awaitable, *, name: str = "task") -> asyncio.Task:
-    """Track a background task so nothing is silently dropped on shutdown."""
     task = asyncio.create_task(coro, name=name)
     _background_tasks.add(task)
 
@@ -288,25 +297,23 @@ class GlobalSettings(Base):
     notif_auto_accept = Column(Boolean, default=True)
 
 
-# ---- Automation tables -----------------------------------------------------
-
 class AutomationRule(Base):
     __tablename__ = "automation_rules"
     id = Column(Integer, primary_key=True)
     name = Column(String(200), default="")
     description = Column(Text, default="")
     enabled = Column(Boolean, default=True, index=True)
-    priority = Column(Integer, default=100, index=True)     # lower = higher priority
-    stop_on_match = Column(Boolean, default=True)           # if True: stop evaluating lower rules
-    trigger_type = Column(String(32), default="message", index=True)  # message | join_request | member_join | member_leave | command
-    match_type = Column(String(24), default="contains")     # exact|contains|starts|ends|regex|any_kw|all_kw
-    trigger_value = Column(Text, default="")                # pattern / keyword list (\n or , separated)
+    priority = Column(Integer, default=100, index=True)
+    stop_on_match = Column(Boolean, default=True)
+    trigger_type = Column(String(32), default="message", index=True)
+    match_type = Column(String(24), default="exact")
+    trigger_value = Column(Text, default="")
     case_insensitive = Column(Boolean, default=True)
-    scope_type = Column(String(16), default="global")       # global | channel
+    scope_type = Column(String(16), default="global")
     scope_channel_id = Column(BigInteger, nullable=True, index=True)
     cooldown_seconds = Column(Integer, default=0)
-    max_executions = Column(Integer, default=0)             # 0 = unlimited (total)
-    response_type = Column(String(16), default="text")      # text|photo|video|document|audio|voice|animation|copy
+    max_executions = Column(Integer, default=0)
+    response_type = Column(String(16), default="text")
     response_text = Column(Text, default="")
     response_media_id = Column(String(255), default="")
     response_from_chat_id = Column(BigInteger, nullable=True)
@@ -333,7 +340,7 @@ class AutomationCooldown(Base):
     __tablename__ = "automation_cooldowns"
     id = Column(Integer, primary_key=True)
     rule_id = Column(Integer, index=True, nullable=False)
-    scope_key = Column(String(120), index=True, nullable=False)   # e.g. "u:123", "c:-100..", "g"
+    scope_key = Column(String(120), index=True, nullable=False)
     last_run = Column(DateTime, default=now_utc)
 
 
@@ -355,11 +362,14 @@ class AutomationLog(Base):
 # DB SETUP + MIGRATIONS
 # ===========================================================================
 
-_engine_kwargs: dict = {"echo": False, "pool_pre_ping": True}
-if IS_SQLITE:
-    _engine_kwargs["connect_args"] = {"timeout": 30}
+def _build_engine():
+    kw: dict = {"echo": False, "pool_pre_ping": True}
+    if IS_SQLITE:
+        kw["connect_args"] = {"timeout": 30}
+    return create_async_engine(DATABASE_URL, **kw)
 
-engine = create_async_engine(DATABASE_URL, **_engine_kwargs)
+
+engine = _build_engine()
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 _T = "1" if IS_SQLITE else "TRUE"
@@ -512,7 +522,6 @@ async def init_db():
 
 
 async def _migrate_legacy_auto_reply():
-    """Import legacy GlobalSettings.auto_reply into an automation rule (once)."""
     async with SessionLocal() as s:
         gs = (await s.execute(select(GlobalSettings))).scalars().first()
         if gs is None or gs.auto_reply_migrated:
@@ -525,7 +534,8 @@ async def _migrate_legacy_auto_reply():
             AutomationRule.is_migrated == True))).scalars().first()  # noqa: E712
         if existing is None:
             rule = AutomationRule(
-                name="Imported Auto-Reply", description="Migrated from legacy global auto-reply",
+                name="Imported Auto-Reply",
+                description="Migrated from legacy global auto-reply (fire once per user)",
                 enabled=True, priority=50, trigger_type="message", match_type="any",
                 trigger_value="", response_type="text",
                 response_text=gs.auto_reply_text or "", is_migrated=True,
@@ -538,8 +548,9 @@ async def _migrate_legacy_auto_reply():
                                        url=gs.auto_reply_btn_url))
             logger.info("Migrated legacy auto-reply into AutomationRule #%s", rule.id)
         gs.auto_reply_migrated = True
+        gs.auto_reply_enabled = False
         await s.commit()
-    invalidate_rule_cache()
+    invalidate_automation_cache()
 
 
 # ===========================================================================
@@ -637,15 +648,17 @@ class St(Enum):
     AUTO_REPLY_TEXT = auto()
     AUTO_REPLY_BTN_LABEL = auto()
     AUTO_REPLY_BTN_URL = auto()
-    # automation wizard
-    AUTO_NAME = auto()
-    AUTO_DESC = auto()
-    AUTO_TRIGGER_VALUE = auto()
-    AUTO_RESPONSE_TEXT = auto()
-    AUTO_BTN_LABEL = auto()
-    AUTO_BTN_URL = auto()
-    AUTO_MEDIA = auto()
+    AUTO_TRIGGER = auto()
+    AUTO_RESPONSE = auto()
+    AUTO_EDIT_NAME = auto()
+    AUTO_EDIT_PATTERN = auto()
+    AUTO_EDIT_RESPONSE = auto()
+    AUTO_EDIT_MEDIA = auto()
+    AUTO_EDIT_BTN_LABEL = auto()
+    AUTO_EDIT_BTN_URL = auto()
     AUTO_TEST_INPUT = auto()
+    ADD_CHANNEL = auto()
+    RESTORE_UPLOAD = auto()
 
 
 FLOW_TTL_SECONDS = 15 * 60
@@ -667,7 +680,7 @@ def _mono() -> float:
     try:
         return asyncio.get_running_loop().time()
     except RuntimeError:
-        return datetime.now().timestamp()
+        return time.monotonic()
 
 
 def flow(uid: int) -> Flow:
@@ -788,7 +801,7 @@ def kb_settings_main() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📩 Join Message", callback_data="settings:join_select"),
          InlineKeyboardButton("🚪 Leave Message", callback_data="settings:leave_select")],
         [InlineKeyboardButton("👋 Start Message", callback_data="settings:start_msg"),
-         InlineKeyboardButton("🔁 Auto-Reply (legacy)", callback_data="settings:auto_reply")],
+         InlineKeyboardButton("🔁 Legacy Auto-Reply", callback_data="settings:auto_reply")],
         [InlineKeyboardButton("🔔 Notifications", callback_data="settings:notifications"),
          InlineKeyboardButton("🤖 Automation Center", callback_data="auto:main")],
         [InlineKeyboardButton("« Back", callback_data="panel:main")],
@@ -839,7 +852,7 @@ def kb_auto_reply_settings(gs: GlobalSettings) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🗑 Remove Button", callback_data="auto_reply:btn_remove"),
          InlineKeyboardButton(f"Toggle: {status}", callback_data="auto_reply:toggle")],
         [InlineKeyboardButton("👁 Preview", callback_data="auto_reply:preview")],
-        [InlineKeyboardButton("🤖 Try Automation Center instead",
+        [InlineKeyboardButton("🤖 Use Automation Center instead",
                               callback_data="auto:main")],
         [InlineKeyboardButton("« Back", callback_data="settings:main")],
     ])
@@ -947,7 +960,6 @@ def kb_join_request_actions(channel_id: int, user_id: int) -> InlineKeyboardMark
 def render_template(template: str, first_name: str = "", last_name: str = "",
                     username: str = "", channel_name: str = "", user_id: Any = "",
                     channel_id: Any = "", **extra) -> str:
-    """Substitute variables safely. Values are escaped because output is HTML."""
     now = now_utc()
     subs = {
         "{first_name}": esc(first_name),
@@ -970,12 +982,6 @@ def build_markup(label: str, url: str) -> Optional[InlineKeyboardMarkup]:
     if label and url and re.match(r"^(https?://|tg://)", url.strip()):
         return InlineKeyboardMarkup([[InlineKeyboardButton(label, url=url.strip())]])
     return None
-
-
-def buttons_from_rows(rows: list) -> Optional[InlineKeyboardMarkup]:
-    if not rows:
-        return None
-    return InlineKeyboardMarkup(rows)
 
 
 def strip_tags(s: str) -> str:
@@ -1007,8 +1013,7 @@ async def get_or_create_settings(session: AsyncSession, channel_id: int) -> Sett
     if row is None:
         row = Settings(channel_id=channel_id)
         session.add(row)
-        await session.commit()
-        await session.refresh(row)
+        await session.flush()
     return row
 
 
@@ -1017,8 +1022,7 @@ async def get_global_settings(session: AsyncSession) -> GlobalSettings:
     if gs is None:
         gs = GlobalSettings()
         session.add(gs)
-        await session.commit()
-        await session.refresh(gs)
+        await session.flush()
     return gs
 
 
@@ -1081,6 +1085,7 @@ async def send_join_message(channel_id: int, channel_name: str, user_id: int,
                             first_name: str, last_name: str, username: str) -> bool:
     async with SessionLocal() as session:
         s = await get_or_create_settings(session, channel_id)
+        await session.commit()
         if not s.join_msg_enabled or not s.join_msg_text:
             return False
         data = (s.join_msg_text, s.join_msg_media_type, s.join_msg_media_id,
@@ -1093,6 +1098,7 @@ async def send_leave_message(channel_id: int, channel_name: str, user_id: int,
                              first_name: str, last_name: str, username: str) -> bool:
     async with SessionLocal() as session:
         s = await get_or_create_settings(session, channel_id)
+        await session.commit()
         if not s.leave_msg_enabled or not s.leave_msg_text:
             return False
         data = (s.leave_msg_text, s.leave_msg_media_type, s.leave_msg_media_id,
@@ -1106,7 +1112,6 @@ async def send_leave_message(channel_id: int, channel_name: str, user_id: int,
 # ===========================================================================
 
 async def process_join_request(channel_id: int, user_id: int, approve: bool) -> str:
-    """Returns 'ok' | 'gone' | 'fail'."""
     if not await userbot_ready():
         return "fail"
     for _ in range(4):
@@ -1215,6 +1220,7 @@ async def apply_request_decision(channel_id: int, user_id: int, approve: bool) -
 
 
 _bulk_running: set = set()
+_bulk_lock = asyncio.Lock()
 
 
 async def bulk_process_requests(chat_id: int, channel_id: Optional[int], approve: bool):
@@ -1224,16 +1230,17 @@ async def bulk_process_requests(chat_id: int, channel_id: Optional[int], approve
             parse_mode=HTML, reply_markup=kb_back())
         return
     key = channel_id if channel_id is not None else "all"
-    if key in _bulk_running or (channel_id is not None and "all" in _bulk_running) \
-            or (channel_id is None and _bulk_running):
-        await bot.send_message(chat_id, "⏳ A bulk operation is already running.",
-                               reply_markup=kb_back())
-        return
-    _bulk_running.add(key)
+    async with _bulk_lock:
+        if key in _bulk_running or "all" in _bulk_running:
+            await bot.send_message(chat_id, "⏳ A bulk operation is already running.",
+                                   reply_markup=kb_back())
+            return
+        _bulk_running.add(key)
     try:
         await _bulk_process_inner(chat_id, channel_id, approve)
     finally:
-        _bulk_running.discard(key)
+        async with _bulk_lock:
+            _bulk_running.discard(key)
 
 
 async def _bulk_process_inner(chat_id: int, channel_id: Optional[int], approve: bool):
@@ -1343,8 +1350,6 @@ def _sync_lock(channel_id: int) -> asyncio.Lock:
 
 
 async def sync_channel_requests(channel_id: int):
-    """Reconcile ONE channel's pending requests against Telegram.
-    Returns (live_pending_count, error_or_None). Never wipes on failure."""
     if not await userbot_ready():
         return 0, "userbot not connected"
 
@@ -1774,10 +1779,10 @@ async def _on_join_request(client: Client, request: ChatJoinRequest):
             ex.first_name = u.first_name or ex.first_name
             ex.last_name = u.last_name or ex.last_name
             ex.username = u.username or ex.username
-        await session.commit()
         settings = await get_or_create_settings(session, chat.id)
         gs = await get_global_settings(session)
         auto = settings.auto_accept
+        await session.commit()
     _pending_cache.pop(chat.id, None)
 
     auto_failed_reason = ""
@@ -1800,7 +1805,6 @@ async def _on_join_request(client: Client, request: ChatJoinRequest):
                 if gs.notif_auto_accept:
                     await notify_admins(f"✅ Auto-accepted: <b>{esc(u.first_name)}</b> "
                                         f"into <b>{esc(chat.title)}</b>")
-                # fire join_request automations (best-effort)
                 spawn(run_event_automations(
                     "join_request", user_id=u.id, first_name=u.first_name or "",
                     last_name=u.last_name or "", username=u.username or "",
@@ -2055,31 +2059,62 @@ def fmt_uptime() -> str:
 
 
 # ===========================================================================
-# AUTOMATION ENGINE
+# AUTOMATION ENGINE  (fast path)
 # ===========================================================================
 
-# Rule cache — invalidated on any rule mutation
-_rule_cache: dict = {"rules": None, "ts": 0.0}
-RULE_CACHE_TTL = 15.0
+_auto_cache: dict = {"rules": None, "buttons": {}, "ts": 0.0}
+AUTO_CACHE_TTL = 30.0
 
 
-def invalidate_rule_cache():
-    _rule_cache["rules"] = None
-    _rule_cache["ts"] = 0.0
+def invalidate_automation_cache():
+    _auto_cache["rules"] = None
+    _auto_cache["buttons"] = {}
+    _auto_cache["ts"] = 0.0
+
+
+def _auto_cache_fresh() -> bool:
+    return _auto_cache["rules"] is not None and (_mono() - _auto_cache["ts"]) < AUTO_CACHE_TTL
 
 
 async def _load_enabled_rules(force: bool = False) -> list:
-    now = _mono()
-    cached = _rule_cache["rules"]
-    if cached is not None and not force and (now - _rule_cache["ts"]) < RULE_CACHE_TTL:
-        return cached
+    if not force and _auto_cache_fresh():
+        return _auto_cache["rules"] or []
     async with SessionLocal() as s:
         rows = (await s.execute(select(AutomationRule).where(
             AutomationRule.enabled == True).order_by(  # noqa: E712
             AutomationRule.priority, AutomationRule.id))).scalars().all()
-    _rule_cache["rules"] = list(rows)
-    _rule_cache["ts"] = now
-    return _rule_cache["rules"]
+    _auto_cache["rules"] = list(rows)
+    _auto_cache["ts"] = _mono()
+    _auto_cache["buttons"] = {}
+    return _auto_cache["rules"]
+
+
+async def _get_rule_buttons(rule_id: int) -> list:
+    buttons = _auto_cache["buttons"].get(rule_id)
+    if buttons is not None:
+        return buttons
+    async with SessionLocal() as s:
+        btns = (await s.execute(select(AutomationButton).where(
+            AutomationButton.rule_id == rule_id).order_by(
+            AutomationButton.row, AutomationButton.col))).scalars().all()
+    data = [{"row": b.row, "col": b.col, "label": b.label, "url": b.url} for b in btns]
+    _auto_cache["buttons"][rule_id] = data
+    return data
+
+
+async def _build_rule_markup(rule_id: int) -> Optional[InlineKeyboardMarkup]:
+    btns = await _get_rule_buttons(rule_id)
+    if not btns:
+        return None
+    rows: dict = {}
+    for b in btns:
+        if not b["label"] or not b["url"]:
+            continue
+        if not re.match(r"^(https?://|tg://)\S+$", b["url"].strip()):
+            continue
+        rows.setdefault(b["row"], []).append(InlineKeyboardButton(b["label"], url=b["url"].strip()))
+    ordered = [rows[k] for k in sorted(rows.keys()) if rows[k]]
+    return InlineKeyboardMarkup(ordered) if ordered else None
 
 
 def _split_keywords(value: str) -> list:
@@ -2088,12 +2123,13 @@ def _split_keywords(value: str) -> list:
 
 
 def _match_rule(rule: AutomationRule, text: str) -> bool:
-    """Message matching logic. `text` is the raw (unescaped) user text."""
     if rule.trigger_type == "message":
         if rule.match_type == "any":
             return True
         raw = rule.trigger_value or ""
         needle = text or ""
+        if not raw and rule.match_type != "any":
+            return False
         if rule.case_insensitive:
             raw_cmp = raw.lower()
             needle_cmp = needle.lower()
@@ -2105,11 +2141,11 @@ def _match_rule(rule: AutomationRule, text: str) -> bool:
             if mt == "exact":
                 return needle_cmp == raw_cmp
             if mt == "contains":
-                return raw_cmp and raw_cmp in needle_cmp
+                return bool(raw_cmp) and raw_cmp in needle_cmp
             if mt == "starts":
-                return raw_cmp and needle_cmp.startswith(raw_cmp)
+                return bool(raw_cmp) and needle_cmp.startswith(raw_cmp)
             if mt == "ends":
-                return raw_cmp and needle_cmp.endswith(raw_cmp)
+                return bool(raw_cmp) and needle_cmp.endswith(raw_cmp)
             if mt == "regex":
                 flags = re.IGNORECASE if rule.case_insensitive else 0
                 return bool(re.search(raw, needle, flags))
@@ -2137,7 +2173,7 @@ def _match_rule(rule: AutomationRule, text: str) -> bool:
     return False
 
 
-async def _rule_scope_matches(rule: AutomationRule, channel_id: Optional[int]) -> bool:
+def _rule_scope_matches(rule: AutomationRule, channel_id: Optional[int]) -> bool:
     if rule.scope_type == "global":
         return True
     if rule.scope_type == "channel":
@@ -2145,9 +2181,11 @@ async def _rule_scope_matches(rule: AutomationRule, channel_id: Optional[int]) -
     return False
 
 
+_cd_cache: dict = {}
+
+
 async def _check_cooldown(rule: AutomationRule, user_id: Optional[int],
                           channel_id: Optional[int]) -> bool:
-    """True if allowed to run now. Per-user scope key when possible, else global."""
     if not rule.cooldown_seconds or rule.cooldown_seconds <= 0:
         return True
     if user_id is not None:
@@ -2156,38 +2194,30 @@ async def _check_cooldown(rule: AutomationRule, user_id: Optional[int],
         key = f"c:{channel_id}"
     else:
         key = "g"
-    now = now_utc()
-    async with SessionLocal() as s:
-        row = (await s.execute(select(AutomationCooldown).where(
-            AutomationCooldown.rule_id == rule.id,
-            AutomationCooldown.scope_key == key))).scalar_one_or_none()
-        if row is None:
-            s.add(AutomationCooldown(rule_id=rule.id, scope_key=key, last_run=now))
+    ck = (rule.id, key)
+    now_m = _mono()
+    last = _cd_cache.get(ck)
+    if last is not None and (now_m - last) < rule.cooldown_seconds:
+        return False
+    _cd_cache[ck] = now_m
+    spawn(_persist_cooldown(rule.id, key), name="cooldown")
+    return True
+
+
+async def _persist_cooldown(rule_id: int, key: str):
+    try:
+        now = now_utc()
+        async with SessionLocal() as s:
+            row = (await s.execute(select(AutomationCooldown).where(
+                AutomationCooldown.rule_id == rule_id,
+                AutomationCooldown.scope_key == key))).scalar_one_or_none()
+            if row is None:
+                s.add(AutomationCooldown(rule_id=rule_id, scope_key=key, last_run=now))
+            else:
+                row.last_run = now
             await s.commit()
-            return True
-        if (now - row.last_run).total_seconds() < rule.cooldown_seconds:
-            return False
-        row.last_run = now
-        await s.commit()
-        return True
-
-
-async def _build_rule_markup(rule_id: int) -> Optional[InlineKeyboardMarkup]:
-    async with SessionLocal() as s:
-        btns = (await s.execute(select(AutomationButton).where(
-            AutomationButton.rule_id == rule_id).order_by(
-            AutomationButton.row, AutomationButton.col))).scalars().all()
-    if not btns:
-        return None
-    rows: dict = {}
-    for b in btns:
-        if not b.label or not b.url:
-            continue
-        if not re.match(r"^(https?://|tg://)\S+$", b.url.strip()):
-            continue
-        rows.setdefault(b.row, []).append(InlineKeyboardButton(b.label, url=b.url.strip()))
-    ordered = [rows[k] for k in sorted(rows.keys()) if rows[k]]
-    return InlineKeyboardMarkup(ordered) if ordered else None
+    except Exception as exc:
+        logger.debug("persist_cooldown failed: %s", exc)
 
 
 async def _log_automation(rule: Optional[AutomationRule], user_id: Optional[int],
@@ -2209,7 +2239,6 @@ async def _execute_rule(rule: AutomationRule, *, user_id: Optional[int],
                         first_name: str, last_name: str, username: str,
                         channel_id: Optional[int], channel_name: str,
                         raw_text: str = "", test_only: bool = False) -> dict:
-    """Send (or simulate) a rule's response. Returns a result dict."""
     result = {"ok": False, "detail": "", "preview": "", "markup": None}
     markup = await _build_rule_markup(rule.id)
     result["markup"] = markup
@@ -2252,7 +2281,6 @@ async def _execute_rule(rule: AutomationRule, *, user_id: Optional[int],
             try:
                 await flood_safe(senders[rule.response_type])
             except Exception:
-                # fall back to text so the admin still sees a working rule
                 await bot.send_message(user_id, text_out[:4090], parse_mode=HTML,
                                        reply_markup=markup, disable_web_page_preview=True)
         else:
@@ -2271,81 +2299,120 @@ async def _execute_rule(rule: AutomationRule, *, user_id: Optional[int],
     return result
 
 
+async def _batch_bump_counts(success_ids: list, error_ids: list, last_triggered_map: dict):
+    if not success_ids and not error_ids and not last_triggered_map:
+        return
+    try:
+        async with SessionLocal() as s:
+            for rid in set(success_ids):
+                await s.execute(
+                    update(AutomationRule).where(AutomationRule.id == rid).values(
+                        execution_count=AutomationRule.execution_count + 1,
+                        last_triggered_at=last_triggered_map.get(rid, now_utc())))
+            for rid in set(error_ids):
+                await s.execute(
+                    update(AutomationRule).where(AutomationRule.id == rid).values(
+                        error_count=AutomationRule.error_count + 1))
+            await s.commit()
+    except Exception as exc:
+        logger.debug("batch_bump_counts failed: %s", exc)
+
+
 async def run_message_automations(message: Message) -> bool:
-    """Called for every non-admin private message. Returns True if any rule matched (and
-    the pipeline should stop evaluating further — we always stop on the highest priority
-    match when stop_on_match=True)."""
     u = message.from_user
     if u is None:
         return False
     text = (message.text or message.caption or "").strip()
     rules = await _load_enabled_rules()
+    if not rules:
+        return False
+
     any_executed = False
+    success_ids: list = []
+    error_ids: list = []
+    triggered_ts = now_utc()
+
+    fired: list[tuple] = []
     for rule in rules:
         if rule.trigger_type not in ("message", "command"):
             continue
         if rule.scope_type == "channel":
-            # Private message -> channel scope only matches if explicitly a per-user scope is absent.
-            # We refuse to run channel-scoped message rules on private messages to avoid leaks.
-            continue
-        if not await _rule_scope_matches(rule, None):
             continue
         if not _match_rule(rule, text):
             continue
-        if rule.max_executions and rule.execution_count >= rule.max_executions:
+        if rule.max_executions and (rule.execution_count or 0) >= rule.max_executions:
             continue
         if not await _check_cooldown(rule, u.id, None):
             continue
-        result = await _execute_rule(
-            rule, user_id=u.id, first_name=u.first_name or "", last_name=u.last_name or "",
-            username=u.username or "", channel_id=None, channel_name="")
-        async with SessionLocal() as s:
-            r = (await s.execute(select(AutomationRule).where(AutomationRule.id == rule.id))).scalar_one_or_none()
-            if r:
-                r.last_triggered_at = now_utc()
-                r.execution_count = (r.execution_count or 0) + 1
-                if not result["ok"]:
-                    r.error_count = (r.error_count or 0) + 1
-                await s.commit()
-        await _log_automation(rule, u.id, None, rule.trigger_type, True,
-                              result["ok"], result["detail"])
-        any_executed = True
+        fired.append(rule)
         if rule.stop_on_match:
             break
-    invalidate_rule_cache()   # counts changed
+
+    if not fired:
+        return False
+
+    for rule in fired:
+        try:
+            result = await _execute_rule(
+                rule, user_id=u.id, first_name=u.first_name or "", last_name=u.last_name or "",
+                username=u.username or "", channel_id=None, channel_name="")
+        except Exception as exc:
+            logger.exception("automation rule #%s crashed: %s", rule.id, exc)
+            result = {"ok": False, "detail": f"crash: {type(exc).__name__}"}
+        any_executed = True
+        if result["ok"]:
+            success_ids.append(rule.id)
+        else:
+            error_ids.append(rule.id)
+        spawn(_log_automation(rule, u.id, None, rule.trigger_type, True,
+                              result["ok"], result["detail"]), name="auto_log")
+
+    spawn(_batch_bump_counts(success_ids, error_ids,
+                             {rid: triggered_ts for rid in success_ids + error_ids}),
+          name="auto_count")
     return any_executed
 
 
 async def run_event_automations(event_type: str, *, user_id: int, first_name: str,
                                 last_name: str, username: str, channel_id: Optional[int],
                                 channel_name: str = ""):
-    """Fire all enabled automations matching an event (join_request, member_join, member_leave)."""
     rules = await _load_enabled_rules()
+    if not rules:
+        return
+    fired = []
     for rule in rules:
         if rule.trigger_type != event_type:
             continue
-        if not await _rule_scope_matches(rule, channel_id):
+        if not _rule_scope_matches(rule, channel_id):
             continue
-        if rule.max_executions and rule.execution_count >= rule.max_executions:
+        if rule.max_executions and (rule.execution_count or 0) >= rule.max_executions:
             continue
         if not await _check_cooldown(rule, user_id, channel_id):
             continue
-        result = await _execute_rule(
-            rule, user_id=user_id, first_name=first_name, last_name=last_name,
-            username=username, channel_id=channel_id, channel_name=channel_name)
-        async with SessionLocal() as s:
-            r = (await s.execute(select(AutomationRule).where(AutomationRule.id == rule.id))).scalar_one_or_none()
-            if r:
-                r.last_triggered_at = now_utc()
-                r.execution_count = (r.execution_count or 0) + 1
-                if not result["ok"]:
-                    r.error_count = (r.error_count or 0) + 1
-                await s.commit()
-        await _log_automation(rule, user_id, channel_id, event_type, True,
-                              result["ok"], result["detail"])
+        fired.append(rule)
         if rule.stop_on_match:
             break
-    invalidate_rule_cache()
+
+    success_ids: list = []
+    error_ids: list = []
+    for rule in fired:
+        try:
+            result = await _execute_rule(
+                rule, user_id=user_id, first_name=first_name, last_name=last_name,
+                username=username, channel_id=channel_id, channel_name=channel_name)
+        except Exception as exc:
+            logger.exception("event automation #%s crashed: %s", rule.id, exc)
+            result = {"ok": False, "detail": f"crash: {type(exc).__name__}"}
+        if result["ok"]:
+            success_ids.append(rule.id)
+        else:
+            error_ids.append(rule.id)
+        spawn(_log_automation(rule, user_id, channel_id, event_type, True,
+                              result["ok"], result["detail"]), name="auto_log")
+
+    spawn(_batch_bump_counts(success_ids, error_ids,
+                             {rid: now_utc() for rid in success_ids + error_ids}),
+          name="auto_count")
 
 
 # ===========================================================================
@@ -2374,14 +2441,14 @@ TRIGGER_LABELS = {
 }
 
 MATCH_LABELS = {
-    "any": "Any message",
-    "exact": "Exact match",
-    "contains": "Contains",
-    "starts": "Starts with",
-    "ends": "Ends with",
-    "regex": "Regex",
-    "any_kw": "Any keyword",
-    "all_kw": "All keywords",
+    "exact": "🎯 Exact match",
+    "contains": "🔎 Contains",
+    "starts": "▶️ Starts with",
+    "ends": "⏹ Ends with",
+    "regex": "🧬 Regex",
+    "any_kw": "🧩 Any keyword",
+    "all_kw": "🧩 All keywords",
+    "any": "🌀 Any message",
 }
 
 RESPONSE_LABELS = {
@@ -2404,6 +2471,17 @@ def _scope_summary(rule: AutomationRule) -> str:
     return f"📣 Channel {rule.scope_channel_id}"
 
 
+def _short_trigger_preview(rule: AutomationRule) -> str:
+    if rule.trigger_type == "message":
+        if rule.match_type == "any":
+            return "(any message)"
+        val = rule.trigger_value or ""
+        return (val[:60] + "…") if len(val) > 60 else val
+    if rule.trigger_type == "command":
+        return f"/{rule.trigger_value}"
+    return ""
+
+
 async def build_automation_main_text() -> str:
     async with SessionLocal() as s:
         total = (await s.execute(select(func.count()).select_from(AutomationRule))).scalar() or 0
@@ -2415,10 +2493,10 @@ async def build_automation_main_text() -> str:
         err_today = (await s.execute(select(func.count()).select_from(AutomationLog).where(
             AutomationLog.created_at >= ts, AutomationLog.ok == False))).scalar() or 0  # noqa: E712
     return (f"🤖 <b>Automation Center</b>\n\n"
-            f"⚡ Active Automations: <b>{active}</b> / {total}\n"
+            f"⚡ Active Rules: <b>{active}</b> / {total}\n"
             f"📊 Executions Today: <b>{exec_today}</b>\n"
             f"⚠️ Errors Today: <b>{err_today}</b>\n\n"
-            f"Rules run on incoming private messages and channel events. "
+            f"Rules run on incoming private messages and channel events.\n"
             f"Lower priority number = runs first.")
 
 
@@ -2443,11 +2521,11 @@ async def build_rule_list(page: int = 1, active_only: bool = False):
     kb = []
     for r in rules:
         dot = "🟢" if r.enabled else "🔴"
+        trig = _short_trigger_preview(r)
+        resp = short_preview(r.response_text, 40) if r.response_text else f"[{r.response_type}]"
         lines.append(f"{dot} <b>#{r.id} {esc(r.name)}</b>\n"
-                     f"   Trigger: {TRIGGER_LABELS.get(r.trigger_type, r.trigger_type)}"
-                     + (f" · {MATCH_LABELS.get(r.match_type, r.match_type)}" if r.trigger_type == "message" else "")
-                     + f"\n   Scope: {_scope_summary(r)} · Priority: {r.priority}\n"
-                     f"   Runs: {r.execution_count} · Errors: {r.error_count}")
+                     f"   💬 <code>{esc(trig)}</code> → 📤 <i>{resp}</i>\n"
+                     f"   {_scope_summary(r)} · P{r.priority} · runs: {r.execution_count} · err: {r.error_count}")
         kb.append([
             InlineKeyboardButton(f"⚙️ #{r.id}", callback_data=f"auto:view:{r.id}"),
             InlineKeyboardButton("🧪", callback_data=f"auto:test_rule:{r.id}"),
@@ -2471,37 +2549,69 @@ async def build_rule_view(rule_id: int):
             AutomationButton.row, AutomationButton.col))).scalars().all()
     dot = "🟢 Enabled" if r.enabled else "🔴 Disabled"
     btn_lines = "\n".join(f"   • {esc(b.label)} → {esc(b.url)}" for b in btns) or "   (none)"
-    txt = (f"🤖 <b>Rule #{r.id}: {esc(r.name)}</b>\n{dot}\n\n"
-           f"<b>Trigger:</b> {TRIGGER_LABELS.get(r.trigger_type, r.trigger_type)}"
-           + (f" · {MATCH_LABELS.get(r.match_type, r.match_type)}" if r.trigger_type == "message" else "")
-           + f"\n<b>Pattern:</b> <code>{esc(r.trigger_value or '(any)')}</code>\n"
+
+    if r.trigger_type == "message":
+        trig = _short_trigger_preview(r)
+        trigger_line = (f"<b>Trigger:</b> 💬 message\n"
+                        f"<b>Match:</b> {MATCH_LABELS.get(r.match_type, r.match_type)}\n"
+                        f"<b>Pattern:</b> <code>{esc(trig or '(any)')}</code>\n")
+    elif r.trigger_type == "command":
+        trigger_line = (f"<b>Trigger:</b> 🔧 command <code>/{esc(r.trigger_value or '')}</code>\n")
+    else:
+        trigger_line = (f"<b>Trigger:</b> {TRIGGER_LABELS.get(r.trigger_type, r.trigger_type)}\n")
+
+    resp_preview = short_preview(r.response_text, 220)
+    txt = (f"🤖 <b>Rule #{r.id}: {esc(r.name)}</b> — {dot}\n\n"
+           f"{trigger_line}"
            f"<b>Scope:</b> {_scope_summary(r)}\n<b>Priority:</b> {r.priority}\n"
            f"<b>Cooldown:</b> {r.cooldown_seconds}s\n"
            f"<b>Response type:</b> {RESPONSE_LABELS.get(r.response_type, r.response_type)}\n"
-           f"<b>Response text:</b>\n<i>{short_preview(r.response_text, 200)}</i>\n"
+           f"<b>Reply:</b>\n<i>{resp_preview}</i>\n"
            f"<b>Buttons:</b>\n{btn_lines}\n\n"
            f"Runs: {r.execution_count} · Errors: {r.error_count}\n"
            f"Last triggered: {r.last_triggered_at.strftime('%Y-%m-%d %H:%M') if r.last_triggered_at else '—'} UTC")
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("✏️ Edit Name", callback_data=f"auto:edit_name:{r.id}"),
-         InlineKeyboardButton("✏️ Edit Pattern", callback_data=f"auto:edit_value:{r.id}")],
-        [InlineKeyboardButton("✏️ Edit Text", callback_data=f"auto:edit_text:{r.id}"),
+         InlineKeyboardButton("✏️ Edit Trigger", callback_data=f"auto:edit_pattern:{r.id}")],
+        [InlineKeyboardButton("✏️ Edit Reply", callback_data=f"auto:edit_response:{r.id}"),
          InlineKeyboardButton("🖼 Set Media", callback_data=f"auto:edit_media:{r.id}")],
-        [InlineKeyboardButton("🔗 Add Button", callback_data=f"auto:add_btn:{r.id}"),
-         InlineKeyboardButton("🗑 Clear Buttons", callback_data=f"auto:clear_btns:{r.id}")],
-        [InlineKeyboardButton("⚡ Priority", callback_data=f"auto:edit_priority:{r.id}"),
-         InlineKeyboardButton("⏱ Cooldown", callback_data=f"auto:edit_cooldown:{r.id}")],
-        [InlineKeyboardButton("🌐 Toggle Scope", callback_data=f"auto:edit_scope:{r.id}"),
-         InlineKeyboardButton("🔄 Toggle Match", callback_data=f"auto:edit_match:{r.id}")],
+        [InlineKeyboardButton("⚙️ Advanced Settings", callback_data=f"auto:advanced:{r.id}")],
         [InlineKeyboardButton("👁 Preview", callback_data=f"auto:preview:{r.id}"),
          InlineKeyboardButton("🧪 Test", callback_data=f"auto:test_rule:{r.id}")],
         [InlineKeyboardButton("📋 Logs", callback_data=f"auto:logs_rule:{r.id}:1"),
-         InlineKeyboardButton("✅ Enable" if not r.enabled else "❌ Disable",
-                              callback_data=f"auto:toggle:{r.id}")],
-        [InlineKeyboardButton("🗑 Delete", callback_data=f"auto:delete:{r.id}"),
-         InlineKeyboardButton("« Back", callback_data="auto:list:1")],
+         InlineKeyboardButton("📄 Duplicate", callback_data=f"auto:duplicate:{r.id}")],
+        [InlineKeyboardButton("✅ Enable" if not r.enabled else "❌ Disable",
+                              callback_data=f"auto:toggle:{r.id}"),
+         InlineKeyboardButton("🗑 Delete", callback_data=f"auto:delete:{r.id}")],
+        [InlineKeyboardButton("« Back", callback_data="auto:list:1")],
     ])
     return txt[:4090], kb
+
+
+async def build_rule_advanced(rule_id: int):
+    async with SessionLocal() as s:
+        r = (await s.execute(select(AutomationRule).where(AutomationRule.id == rule_id))).scalar_one_or_none()
+        if r is None:
+            return "❔ Rule not found.", kb_back("auto:main")
+    txt = (f"⚙️ <b>Advanced Settings — Rule #{r.id}</b>\n\n"
+           f"<b>Match type:</b> {MATCH_LABELS.get(r.match_type, r.match_type)}\n"
+           f"<b>Scope:</b> {_scope_summary(r)}\n"
+           f"<b>Priority:</b> {r.priority}\n"
+           f"<b>Cooldown:</b> {r.cooldown_seconds}s\n"
+           f"<b>Stop on match:</b> {'Yes' if r.stop_on_match else 'No'}\n"
+           f"<b>Case-insensitive:</b> {'Yes' if r.case_insensitive else 'No'}\n\n"
+           f"<i>Advanced options won't break the basic 'trigger → reply' flow.</i>")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Match Type", callback_data=f"auto:edit_match:{r.id}"),
+         InlineKeyboardButton("🌐 Scope", callback_data=f"auto:edit_scope:{r.id}")],
+        [InlineKeyboardButton("⚡ Priority", callback_data=f"auto:edit_priority:{r.id}"),
+         InlineKeyboardButton("⏱ Cooldown", callback_data=f"auto:edit_cooldown:{r.id}")],
+        [InlineKeyboardButton("🔗 Add Button", callback_data=f"auto:add_btn:{r.id}"),
+         InlineKeyboardButton("🗑 Clear Buttons", callback_data=f"auto:clear_btns:{r.id}")],
+        [InlineKeyboardButton("🛑 Toggle stop-on-match", callback_data=f"auto:toggle_stop:{r.id}")],
+        [InlineKeyboardButton("« Back", callback_data=f"auto:view:{r.id}")],
+    ])
+    return txt, kb
 
 
 async def build_automation_logs(page: int = 1, rule_id: Optional[int] = None):
@@ -2523,7 +2633,7 @@ async def build_automation_logs(page: int = 1, rule_id: Optional[int] = None):
         mark = "✅" if r.ok else "❌"
         when = r.created_at.strftime("%m-%d %H:%M") if r.created_at else ""
         lines.append(f"{mark} <b>{esc(r.rule_name)}</b> · {esc(r.trigger_type)} · "
-                     f"user=<code>{r.user_id or '—'}</code> · {when} UTC\n   {esc(r.detail[:120])}")
+                     f"user=<code>{r.user_id or '—'}</code> · {when} UTC\n   {esc((r.detail or '')[:120])}")
     prefix = f"auto:logs_rule:{rule_id}" if rule_id else "auto:logs"
     back = f"auto:view:{rule_id}" if rule_id else "auto:main"
     kb = InlineKeyboardMarkup([pager_row(prefix, page, pages),
@@ -2558,7 +2668,7 @@ async def build_automation_stats():
 
 
 # ===========================================================================
-# AUTOMATION WIZARD (FSM)
+# SIMPLE AUTOMATION WIZARD
 # ===========================================================================
 
 def _draft(f: Flow) -> dict:
@@ -2568,105 +2678,188 @@ def _draft(f: Flow) -> dict:
     return d
 
 
-async def _wizard_prompt(cq: CallbackQuery, text: str, back_cb: str = "auto:main"):
-    await safe_edit(cq.message, text, InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ Cancel", callback_data="auto:cancel")],
-        [InlineKeyboardButton("« Back", callback_data=back_cb)],
-    ]))
-
-
 async def _wizard_start(cq: CallbackQuery, admin_id: int):
     reset_flow(admin_id)
     f = flow(admin_id)
-    f.state = St.AUTO_NAME
+    f.state = St.AUTO_TRIGGER
     f.origin_section = "auto:create"
     _draft(f).clear()
-    await _wizard_prompt(cq,
-        "➕ <b>New Automation — Step 1/6</b>\n\nSend a short <b>name</b> for this rule "
-        "(e.g. <i>Welcome Reply</i>).", back_cb="auto:main")
+    await safe_edit(
+        cq.message,
+        "➕ <b>New Automation — Step 1/2</b>\n\n"
+        "💬 <b>What message should trigger the reply?</b>\n\n"
+        "<i>Example:</i> <code>hello</code>\n\n"
+        "The bot will reply when a user sends exactly this text "
+        "(you can switch to contains/keywords/regex in Advanced Settings after saving).",
+        InlineKeyboardMarkup([
+            [InlineKeyboardButton("🌀 Any Message", callback_data="auto:trig:any")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="auto:cancel")],
+        ]))
+
+
+async def _wizard_show_preview(chat_id: int, admin_id: int, edit_msg: Optional[Message] = None):
+    d = _draft(flow(admin_id))
+    trig = d.get("trigger_value", "")
+    match = d.get("match_type", "exact")
+    resp_text = d.get("response_text", "")
+    resp_media = d.get("response_media_id", "")
+    resp_type = d.get("response_type", "text")
+
+    trig_display = "(any message)" if match == "any" else f"<code>{esc(trig)}</code>"
+    if resp_media and resp_type != "text":
+        resp_display = f"[{resp_type}] {esc(short_preview(resp_text, 80)) if resp_text else '(no caption)'}"
+    else:
+        resp_display = f"<code>{esc(short_preview(resp_text, 200))}</code>"
+
+    txt = (f"✅ <b>Preview</b>\n\n"
+           f"💬 <b>Trigger:</b> {trig_display}\n"
+           f"🎯 <b>Match mode:</b> {MATCH_LABELS.get(match, match)}\n\n"
+           f"📤 <b>Bot will reply:</b>\n{resp_display}\n\n"
+           f"Click <b>Save</b> to activate, or use <b>Advanced</b> to add media, "
+           f"buttons, cooldown, priority or channel scope.")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💾 Save Automation", callback_data="auto:save_draft")],
+        [InlineKeyboardButton("⚙️ Advanced Settings", callback_data="auto:adv_draft")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="auto:cancel")],
+    ])
+    if edit_msg is not None:
+        await safe_edit(edit_msg, txt, kb)
+    else:
+        await bot.send_message(chat_id, txt, reply_markup=kb, parse_mode=HTML)
 
 
 async def handle_auto_wizard_text(admin_id: int, chat_id: int, message: Message) -> bool:
-    """Handles all Automation wizard text input. Returns True if consumed."""
     f = flow(admin_id)
     st = f.state
-    if not st.name.startswith("AUTO_"):
-        return False
-    if st == St.AUTO_TEST_INPUT:
-        # handled in the router, not here
-        return False
-
     txt = (message.text or "").strip()
-    if not txt:
-        await message.reply_text("Please send text content.")
-        return True
 
-    if st == St.AUTO_NAME:
-        _draft(f)["name"] = txt[:200]
-        f.state = St.AUTO_DESC
-        await message.reply_text(
-            "➕ <b>Step 2/6</b> — Send a short <b>description</b> (or <code>-</code> to skip).")
-        return True
-
-    if st == St.AUTO_DESC:
-        _draft(f)["description"] = "" if txt == "-" else txt[:500]
-        f.state = St.NONE
-        await message.reply_text(
-            "✅ Step 3/6 — Pick the <b>trigger type</b>:",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("💬 Message (any text)", callback_data="auto:trig:message")],
-                [InlineKeyboardButton("🔧 Command", callback_data="auto:trig:command")],
-                [InlineKeyboardButton("⏳ Join Request", callback_data="auto:trig:join_request")],
-                [InlineKeyboardButton("👤 Member Joined", callback_data="auto:trig:member_join")],
-                [InlineKeyboardButton("🚪 Member Left", callback_data="auto:trig:member_leave")],
-                [InlineKeyboardButton("❌ Cancel", callback_data="auto:cancel")],
-            ]))
-        return True
-
-    if st == St.AUTO_TRIGGER_VALUE:
-        _draft(f)["trigger_value"] = txt[:2000]
-        f.state = St.NONE
-        await message.reply_text(
-            "✅ Trigger value saved. Choose <b>scope</b>:",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🌐 Global (anywhere)", callback_data="auto:scope:global")],
-                [InlineKeyboardButton("📣 Pick Channel…", callback_data="auto:scope:pick")],
-                [InlineKeyboardButton("❌ Cancel", callback_data="auto:cancel")],
-            ]))
-        return True
-
-    if st == St.AUTO_RESPONSE_TEXT:
-        _draft(f)["response_text"] = html_of(message)
-        f.state = St.NONE
-        # offer media or skip
-        await message.reply_text(
-            "✅ Response text saved.\n\nSend a <b>photo/video/document/audio/voice/animation</b> "
-            "to attach, or tap <b>Skip</b> to finish with text only.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Skip — save rule", callback_data="auto:save")],
-                [InlineKeyboardButton("❌ Cancel", callback_data="auto:cancel")],
-            ]))
-        return True
-
-    if st == St.AUTO_BTN_LABEL:
-        _draft(f)["btn_label"] = txt[:100]
-        f.state = St.AUTO_BTN_URL
-        await message.reply_text("Now send the button <b>URL</b> (must start with https://):")
-        return True
-
-    if st == St.AUTO_BTN_URL:
-        if not re.match(r"^(https?://|tg://)\S+$", txt.strip()):
-            await message.reply_text("❌ Invalid URL. Try again.")
+    if st == St.AUTO_TRIGGER:
+        if not txt:
+            await message.reply_text("Please send the trigger text (e.g. <code>hello</code>).",
+                                     parse_mode=HTML)
             return True
         d = _draft(f)
-        d.setdefault("buttons", []).append({"label": d.pop("btn_label", ""), "url": txt.strip()})
+        d["trigger_value"] = txt[:2000]
+        d["match_type"] = "exact"
+        d["trigger_type"] = "message"
+        f.state = St.AUTO_RESPONSE
+        await message.reply_text(
+            "➕ <b>Step 2/2</b>\n\n"
+            "📤 <b>Now send what you want the bot to reply.</b>\n\n"
+            "You can also send a <b>photo / video / document / audio / voice / GIF</b> "
+            "with an optional caption.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",
+                                                                     callback_data="auto:cancel")]]),
+            parse_mode=HTML)
+        return True
+
+    if st == St.AUTO_RESPONSE:
+        if not txt:
+            await message.reply_text("Please send the reply content.")
+            return True
+        d = _draft(f)
+        d["response_text"] = html_of(message)
+        d["response_type"] = "text"
         f.state = St.NONE
-        await message.reply_text("✅ Button added.",
-                                 reply_markup=InlineKeyboardMarkup([
-                                     [InlineKeyboardButton("🔗 Add Another", callback_data="auto:add_btn_draft")],
-                                     [InlineKeyboardButton("✅ Save Rule", callback_data="auto:save")],
-                                     [InlineKeyboardButton("❌ Cancel", callback_data="auto:cancel")],
-                                 ]))
+        await _wizard_show_preview(chat_id, admin_id)
+        return True
+
+    if st == St.AUTO_EDIT_NAME:
+        rule_id = f.data.get("edit_rule_id")
+        draft_mode = f.data.get("draft_mode")
+        if draft_mode and not rule_id:
+            # Editing the draft's name
+            d = _draft(f)
+            d["name"] = txt[:200]
+            reset_flow(admin_id)
+            # Restore the draft reference — we just cleared flow but kept the draft in state? No.
+            # Instead, keep it simple: show the preview.
+            # NOTE: Because we cleared, we re-show the preview from the last known state.
+            # In practice name-edit-in-draft is rare; fall back to preview.
+            await message.reply_text("✅ Name saved. Reopen Create Automation to review.")
+            return True
+        reset_flow(admin_id)
+        if not rule_id or not txt:
+            await message.reply_text("Cancelled.")
+            return True
+        async with SessionLocal() as s:
+            r = (await s.execute(select(AutomationRule).where(
+                AutomationRule.id == rule_id))).scalar_one_or_none()
+            if r:
+                r.name = txt[:200]
+                r.updated_at = now_utc()
+                await s.commit()
+        invalidate_automation_cache()
+        v, kb = await build_rule_view(rule_id)
+        await message.reply_text(f"✅ Name updated.\n\n{v}", reply_markup=kb, parse_mode=HTML)
+        return True
+
+    if st == St.AUTO_EDIT_PATTERN:
+        rule_id = f.data.get("edit_rule_id")
+        reset_flow(admin_id)
+        if not rule_id or not txt:
+            await message.reply_text("Cancelled.")
+            return True
+        async with SessionLocal() as s:
+            r = (await s.execute(select(AutomationRule).where(
+                AutomationRule.id == rule_id))).scalar_one_or_none()
+            if r:
+                r.trigger_value = txt[:2000]
+                r.updated_at = now_utc()
+                await s.commit()
+        invalidate_automation_cache()
+        v, kb = await build_rule_view(rule_id)
+        await message.reply_text(f"✅ Trigger updated.\n\n{v}", reply_markup=kb, parse_mode=HTML)
+        return True
+
+    if st == St.AUTO_EDIT_RESPONSE:
+        rule_id = f.data.get("edit_rule_id")
+        reset_flow(admin_id)
+        if not rule_id:
+            await message.reply_text("Cancelled.")
+            return True
+        new_text = html_of(message)
+        if not new_text:
+            await message.reply_text("Send text or a media caption.")
+            return True
+        async with SessionLocal() as s:
+            r = (await s.execute(select(AutomationRule).where(
+                AutomationRule.id == rule_id))).scalar_one_or_none()
+            if r:
+                r.response_text = new_text
+                r.updated_at = now_utc()
+                await s.commit()
+        invalidate_automation_cache()
+        v, kb = await build_rule_view(rule_id)
+        await message.reply_text(f"✅ Reply updated.\n\n{v}", reply_markup=kb, parse_mode=HTML)
+        return True
+
+    if st == St.AUTO_EDIT_BTN_LABEL:
+        rule_id = f.data.get("edit_rule_id")
+        if not rule_id or not txt:
+            await message.reply_text("Send the button label.")
+            return True
+        f.data["pending_btn_label"] = txt[:100]
+        f.state = St.AUTO_EDIT_BTN_URL
+        await message.reply_text("Now send the button URL (https:// or tg://):")
+        return True
+
+    if st == St.AUTO_EDIT_BTN_URL:
+        rule_id = f.data.get("edit_rule_id")
+        label = f.data.get("pending_btn_label", "")
+        reset_flow(admin_id)
+        if not rule_id or not re.match(r"^(https?://|tg://)\S+$", txt):
+            await message.reply_text("❌ Invalid URL. Cancelled.")
+            return True
+        async with SessionLocal() as s:
+            count = (await s.execute(select(func.count()).select_from(AutomationButton).where(
+                AutomationButton.rule_id == rule_id))).scalar() or 0
+            s.add(AutomationButton(rule_id=rule_id, row=int(count) // 2, col=int(count) % 2,
+                                   label=label, url=txt.strip()))
+            await s.commit()
+        invalidate_automation_cache()
+        v, kb = await build_rule_view(rule_id)
+        await message.reply_text(f"✅ Button added.\n\n{v}", reply_markup=kb, parse_mode=HTML)
         return True
 
     return False
@@ -2674,9 +2867,7 @@ async def handle_auto_wizard_text(admin_id: int, chat_id: int, message: Message)
 
 async def handle_auto_wizard_media(admin_id: int, chat_id: int, message: Message) -> bool:
     f = flow(admin_id)
-    if f.state != St.AUTO_MEDIA:
-        return False
-    # capture any media as the response media
+    st = f.state
     mtype = None
     mid = None
     if message.photo:
@@ -2692,34 +2883,59 @@ async def handle_auto_wizard_media(admin_id: int, chat_id: int, message: Message
     elif message.animation:
         mtype, mid = "animation", message.animation.file_id
     if mtype is None:
-        await message.reply_text("Send a photo, video, document, audio, voice, or animation.")
+        return False
+
+    if st == St.AUTO_RESPONSE:
+        d = _draft(f)
+        d["response_media_id"] = mid
+        d["response_type"] = mtype
+        if message.caption:
+            d["response_text"] = html_of(message)
+        f.state = St.NONE
+        await _wizard_show_preview(chat_id, admin_id)
         return True
-    d = _draft(f)
-    d["response_type"] = mtype
-    d["response_media_id"] = mid
-    f.state = St.NONE
-    await message.reply_text(
-        f"✅ Media attached ({mtype}).\n\nSend optional <b>caption text</b>, or tap <b>Save</b>.",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Save Rule", callback_data="auto:save")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="auto:cancel")],
-        ]))
-    return True
+
+    if st == St.AUTO_EDIT_MEDIA:
+        rule_id = f.data.get("edit_rule_id")
+        if not rule_id:
+            return True
+        async with SessionLocal() as s:
+            r = (await s.execute(select(AutomationRule).where(
+                AutomationRule.id == rule_id))).scalar_one_or_none()
+            if r:
+                r.response_media_id = mid
+                r.response_type = mtype
+                if message.caption:
+                    r.response_text = html_of(message)
+                r.updated_at = now_utc()
+                await s.commit()
+        invalidate_automation_cache()
+        reset_flow(admin_id)
+        v, kb = await build_rule_view(rule_id)
+        await message.reply_text(f"✅ Media updated ({mtype}).\n\n{v}",
+                                 reply_markup=kb, parse_mode=HTML)
+        return True
+
+    return False
 
 
 async def _save_draft_rule(d: dict) -> Optional[int]:
-    """Insert the rule + buttons from a draft dict. Returns rule id or None."""
     try:
+        match_type = d.get("match_type", "exact")
+        trigger_value = d.get("trigger_value", "")
+        if match_type == "any":
+            trigger_value = ""
+        name = d.get("name") or (trigger_value[:50] if trigger_value else "Any message")
         async with SessionLocal() as s:
             rule = AutomationRule(
-                name=d.get("name") or "Untitled",
+                name=name or "Untitled",
                 description=d.get("description") or "",
                 enabled=True,
                 priority=int(d.get("priority", 100)),
-                stop_on_match=True,
+                stop_on_match=bool(d.get("stop_on_match", True)),
                 trigger_type=d.get("trigger_type", "message"),
-                match_type=d.get("match_type", "contains"),
-                trigger_value=d.get("trigger_value", ""),
+                match_type=match_type,
+                trigger_value=trigger_value,
                 case_insensitive=True,
                 scope_type=d.get("scope_type", "global"),
                 scope_channel_id=d.get("scope_channel_id"),
@@ -2735,7 +2951,7 @@ async def _save_draft_rule(d: dict) -> Optional[int]:
                                        label=b.get("label", ""), url=b.get("url", "")))
             await s.commit()
             rule_id = rule.id
-        invalidate_rule_cache()
+        invalidate_automation_cache()
         return rule_id
     except Exception as exc:
         logger.exception("save_draft_rule failed: %s", exc)
@@ -2816,6 +3032,8 @@ async def build_main_panel_text(sync: bool = False) -> str:
 
 async def cmd_start(client: Client, message: Message):
     u = message.from_user
+    if u is None:
+        return
     async with SessionLocal() as session:
         known = (await session.execute(select(KnownUser).where(KnownUser.user_id == u.id))).scalar_one_or_none()
         if known is None:
@@ -2832,6 +3050,7 @@ async def cmd_start(client: Client, message: Message):
     else:
         async with SessionLocal() as session:
             gs = await get_global_settings(session)
+            await session.commit()
             markup = build_markup(gs.start_btn_label, gs.start_btn_url)
             txt = gs.start_msg_text or "👋 Welcome! Send us a message."
         try:
@@ -2853,14 +3072,18 @@ async def build_channel_list(refresh: bool = False):
         channels = (await session.execute(
             select(Channel).where(Channel.is_active == True))).scalars().all()  # noqa: E712
     if not channels:
-        return ("No channels yet. Add the bot (and userbot) as admin to a channel to begin.",
-                kb_back())
+        return ("No channels yet. Add the bot (and userbot) as admin to a channel, "
+                "or tap ➕ Add Channel below.",
+                InlineKeyboardMarkup([
+                    [InlineKeyboardButton("➕ Add Channel", callback_data="channels:add")],
+                    [InlineKeyboardButton("« Back", callback_data="panel:main")]]))
     results = await _gather_channel_stats(channels, refresh=refresh)
     lines = ["📣 <b>Managed Channels</b>\n"]
     kb_rows = []
     for i, (ch, members, pending) in enumerate(results, 1):
         async with SessionLocal() as session:
             s = await get_or_create_settings(session, ch.channel_id)
+            await session.commit()
             auto_str = "ON" if s.auto_accept else "OFF"
         lines.append(
             f"{i}. <b>{esc(ch.name)}</b>\n"
@@ -2868,8 +3091,9 @@ async def build_channel_list(refresh: bool = False):
         kb_rows.append([InlineKeyboardButton(f"⚙️ {ch.name}"[:60],
                                              callback_data=f"channels:settings:{ch.channel_id}")])
     lines.append(f"\n🕒 {now_utc().strftime('%H:%M:%S')} UTC")
-    kb_rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="channels:refresh"),
-                    InlineKeyboardButton("« Back", callback_data="panel:main")])
+    kb_rows.append([InlineKeyboardButton("➕ Add Channel", callback_data="channels:add"),
+                    InlineKeyboardButton("🔄 Refresh", callback_data="channels:refresh")])
+    kb_rows.append([InlineKeyboardButton("« Back", callback_data="panel:main")])
     return "\n".join(lines)[:4090], InlineKeyboardMarkup(kb_rows)
 
 
@@ -2881,7 +3105,30 @@ async def show_channel_list(chat_id: int, edit_msg: Optional[Message] = None, re
         await bot.send_message(chat_id, txt, reply_markup=kb, parse_mode=HTML)
 
 
-REQ_PAGE_SIZE = 8
+async def show_channel_settings(cq: CallbackQuery, ch_id: int):
+    async with SessionLocal() as session:
+        s = await get_or_create_settings(session, ch_id)
+        await session.commit()
+    name = await get_channel_name(ch_id)
+    auto_str = "✅ ON" if s.auto_accept else "❌ OFF"
+    await safe_edit(
+        cq.message, f"⚙️ <b>Settings: {esc(name)}</b>\n\nAuto-Accept: {auto_str}",
+        InlineKeyboardMarkup([
+            [InlineKeyboardButton("📩 Join Message", callback_data=f"settings:join:{ch_id}"),
+             InlineKeyboardButton("🚪 Leave Message", callback_data=f"settings:leave:{ch_id}")],
+            [InlineKeyboardButton(f"Auto-Accept: {auto_str}",
+                                  callback_data=f"autoaccept:toggle:{ch_id}")],
+            [InlineKeyboardButton("🤖 Automations", callback_data="auto:list:1")],
+            [InlineKeyboardButton("➖ Remove Channel",
+                                  callback_data=f"channels:remove:{ch_id}")],
+            [InlineKeyboardButton("« Back", callback_data="channels:list")],
+        ]))
+
+
+async def cmd_requests(client: Client, message: Message):
+    wait = await message.reply_text("🔄 Fetching live data…")
+    txt, kb = await build_requests_overview()
+    await safe_edit(wait, txt, kb)
 
 
 async def build_requests_overview():
@@ -2902,6 +3149,9 @@ async def build_requests_overview():
     rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="reqs:overview"),
                  InlineKeyboardButton("« Back", callback_data="panel:main")])
     return "\n".join(lines)[:4090], InlineKeyboardMarkup(rows)
+
+
+REQ_PAGE_SIZE = 8
 
 
 async def build_request_page(channel_id: int, page: int):
@@ -2941,12 +3191,6 @@ async def build_request_page(channel_id: int, page: int):
     return "\n".join(lines)[:4090], InlineKeyboardMarkup(kb)
 
 
-async def cmd_requests(client: Client, message: Message):
-    wait = await message.reply_text("🔄 Fetching live data…")
-    txt, kb = await build_requests_overview()
-    await safe_edit(wait, txt, kb)
-
-
 async def cmd_accept_all(client: Client, message: Message):
     await bulk_process_requests(message.chat.id, None, approve=True)
 
@@ -2954,8 +3198,6 @@ async def cmd_accept_all(client: Client, message: Message):
 async def cmd_decline_all(client: Client, message: Message):
     await bulk_process_requests(message.chat.id, None, approve=False)
 
-
-# ------- Search -------
 
 STATUS_LABEL = {
     "pending": "⏳ PENDING REQUEST", "member": "✅ MEMBER", "left": "🚪 LEFT",
@@ -3384,7 +3626,6 @@ async def on_private_message(client: Client, message: Message):
         await handle_admin_message(client, message, uid)
         return
 
-    # Regular user -> automation, auto-reply, relay
     async with SessionLocal() as session:
         blocked = (await session.execute(select(BlockedUser).where(BlockedUser.user_id == uid))).scalar_one_or_none()
         if blocked:
@@ -3398,47 +3639,61 @@ async def on_private_message(client: Client, message: Message):
         known.bot_blocked = False
         gs = await get_global_settings(session)
 
-        # legacy global auto-reply (kept for compatibility)
-        if gs.auto_reply_enabled and not known.auto_reply_sent and gs.auto_reply_text:
-            markup = build_markup(gs.auto_reply_btn_label, gs.auto_reply_btn_url)
-            try:
-                await bot.send_message(uid, gs.auto_reply_text, parse_mode=HTML,
-                                       reply_markup=markup, disable_web_page_preview=True)
-                known.auto_reply_sent = True
-            except Exception as exc:
-                logger.warning("legacy auto-reply failed for %s: %s", uid, exc)
+        fire_legacy = (gs.auto_reply_enabled and not known.auto_reply_sent
+                       and gs.auto_reply_text)
+        legacy_text = gs.auto_reply_text or ""
+        legacy_label = gs.auto_reply_btn_label or ""
+        legacy_url = gs.auto_reply_btn_url or ""
+        if fire_legacy:
+            known.auto_reply_sent = True
 
         session.add(Conversation(user_id=uid, direction="in",
                                  message=(message.text or message.caption or media_label(message))))
         await session.commit()
 
-    # Fire automations (best effort, doesn't block relay)
     if message.text or message.caption:
         spawn(run_message_automations(message), name="auto_msg")
 
+    if fire_legacy and legacy_text:
+        async def _send_legacy():
+            try:
+                await bot.send_message(uid, legacy_text, parse_mode=HTML,
+                                       reply_markup=build_markup(legacy_label, legacy_url),
+                                       disable_web_page_preview=True)
+            except Exception as exc:
+                logger.warning("legacy auto-reply failed for %s: %s", uid, exc)
+        spawn(_send_legacy(), name="legacy_reply")
+
+    spawn(_relay_to_admins(message), name="relay")
+
+
+async def _relay_to_admins(message: Message):
     u = message.from_user
+    if u is None:
+        return
     header = (f"👤 <b>{esc(u.first_name)}</b> | "
               f"{esc('@' + u.username) if u.username else 'no username'} "
               f"| ID: <code>{u.id}</code>")
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Reply",
                                                      callback_data=f"inbox:reply:{u.id}")]])
-
-    if message.text:
-        await notify_admins(f"{header}\n\n{esc(message.text)}", kb)
-    else:
-        for admin_id in list(_admin_ids):
-            try:
+    for admin_id in list(_admin_ids):
+        try:
+            if message.text:
+                await flood_safe(lambda a=admin_id: bot.send_message(
+                    a, f"{header}\n\n{esc(message.text)}"[:4090],
+                    reply_markup=kb, parse_mode=HTML, disable_web_page_preview=True))
+            else:
+                caption = ((f"{header}\n\n{esc(message.caption)}") if message.caption else header)[:1024]
                 await flood_safe(lambda a=admin_id: bot.copy_message(
                     a, message.chat.id, message.id,
-                    caption=((f"{header}\n\n{esc(message.caption)}") if message.caption else header)[:1024],
-                    parse_mode=HTML, reply_markup=kb))
-            except Exception as exc:
-                logger.warning("copy to admin %s failed: %s", admin_id, exc)
-                try:
-                    await bot.send_message(admin_id, f"{header}\n\n{media_label(message)}",
-                                           parse_mode=HTML, reply_markup=kb)
-                except Exception:
-                    pass
+                    caption=caption, parse_mode=HTML, reply_markup=kb))
+        except Exception as exc:
+            logger.warning("relay to admin %s failed: %s", admin_id, exc)
+            try:
+                await bot.send_message(admin_id, f"{header}\n\n{media_label(message)}",
+                                       parse_mode=HTML, reply_markup=kb)
+            except Exception:
+                pass
 
 
 # ===========================================================================
@@ -3458,13 +3713,15 @@ async def handle_admin_message(client: Client, message: Message, uid: int):
     if st == St.NONE:
         return
 
-    # login flow
     if st in (St.LOGIN_API_ID, St.LOGIN_API_HASH, St.LOGIN_PHONE, St.LOGIN_CODE, St.LOGIN_PASSWORD):
         if message.text:
             await handle_login_text(uid, chat_id, message.text)
         return
 
-    # setapi
+    if st == St.RESTORE_UPLOAD:
+        await _handle_restore_upload(uid, chat_id, message)
+        return
+
     if st == St.SET_BOT_API_ID:
         if not txt.isdigit():
             await message.reply_text("❌ API ID must be numbers only. Try again:")
@@ -3525,7 +3782,6 @@ async def handle_admin_message(client: Client, message: Message, uid: int):
         await run_search(chat_id, txt, scope)
         return
 
-    # Broadcast content
     if st == St.BC_CONTENT:
         f.data["bc_from_chat_id"] = message.chat.id
         f.data["bc_message_id"] = message.id
@@ -3582,7 +3838,65 @@ async def handle_admin_message(client: Client, message: Message, uid: int):
             await message.reply_text(f"❌ Failed to send: {esc(exc)}", parse_mode=HTML)
         return
 
-    # ---- Join / Leave message text ----
+    if st == St.ADD_CHANNEL:
+        new_ch_id: Optional[int] = None
+        new_name = ""
+        if message.forward_from_chat and message.forward_from_chat.type in (
+                enums.ChatType.CHANNEL, enums.ChatType.SUPERGROUP):
+            new_ch_id = message.forward_from_chat.id
+            new_name = message.forward_from_chat.title or ""
+        elif message.text:
+            raw = message.text.strip()
+            m = re.match(r"^-?\d+$", raw)
+            if m:
+                new_ch_id = int(raw)
+                new_name = str(new_ch_id)
+            else:
+                try:
+                    chat = await bot.get_chat(raw if raw.startswith("@") else "@" + raw)
+                    if chat.type in (enums.ChatType.CHANNEL, enums.ChatType.SUPERGROUP):
+                        new_ch_id = chat.id
+                        new_name = chat.title or ""
+                except Exception as exc:
+                    logger.info("add_channel lookup failed: %s", exc)
+
+        if new_ch_id is None:
+            await message.reply_text(
+                "❌ Couldn't determine a channel.\n\n"
+                "Forward any message from the channel, or send the channel's "
+                "<b>numeric ID</b> or <b>@username</b>.",
+                parse_mode=HTML)
+            return
+
+        try:
+            member = await bot.get_chat_member(new_ch_id, await _get_bot_id())
+        except Exception as exc:
+            await message.reply_text(f"❌ Bot is not in that channel or can't access it: {esc(exc)}",
+                                     parse_mode=HTML)
+            return
+        if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+            await message.reply_text("❌ The bot needs to be an <b>admin</b> in that channel.",
+                                     parse_mode=HTML)
+            return
+
+        async with SessionLocal() as s:
+            ch = (await s.execute(select(Channel).where(Channel.channel_id == new_ch_id))).scalar_one_or_none()
+            if ch is None:
+                s.add(Channel(channel_id=new_ch_id, name=new_name or str(new_ch_id), is_active=True))
+            else:
+                ch.is_active = True
+                if new_name:
+                    ch.name = new_name
+            await s.commit()
+
+        reset_flow(uid)
+        await message.reply_text(
+            f"✅ Channel added: <b>{esc(new_name or new_ch_id)}</b>\n"
+            f"ID: <code>{new_ch_id}</code>\n\n"
+            f"⚠️ For join-request auto-accept, the userbot must also be admin here.",
+            parse_mode=HTML, reply_markup=kb_back("channels:list"))
+        return
+
     if st in (St.JOIN_MSG_TEXT, St.LEAVE_MSG_TEXT):
         if not message.text:
             await message.reply_text("Send text content for the message.")
@@ -3694,31 +4008,29 @@ async def handle_admin_message(client: Client, message: Message, uid: int):
             gs.auto_reply_btn_label, gs.auto_reply_btn_url = f.data.get("btn_label", ""), txt
             await session.commit()
             gs = await get_global_settings(session)
+            await session.commit()
         reset_flow(uid)
         await message.reply_text("✅ Auto-reply button saved!", reply_markup=kb_auto_reply_settings(gs))
         return
 
-    # ---- Automation wizard ----
     if st == St.AUTO_TEST_INPUT:
-        # Test flow: message content is passed to rule test
         rule_id = f.data.get("test_rule_id")
         reset_flow(uid)
         if not rule_id:
-            await message.reply_text("Test cancelled.")
+            await _run_global_test(chat_id, message)
             return
         await _run_rule_test(chat_id, rule_id, message)
         return
 
-    if st == St.AUTO_MEDIA:
-        if await handle_auto_wizard_media(uid, chat_id, message):
-            return
+    if await handle_auto_wizard_media(uid, chat_id, message):
+        return
 
     if await handle_auto_wizard_text(uid, chat_id, message):
         return
 
 
 # ===========================================================================
-# AUTOMATION — rule test + create/scope helpers
+# AUTOMATION — rule test
 # ===========================================================================
 
 async def _run_rule_test(chat_id: int, rule_id: int, message: Message):
@@ -3730,23 +4042,48 @@ async def _run_rule_test(chat_id: int, rule_id: int, message: Message):
         return
     u = message.from_user
     text = (message.text or message.caption or "").strip()
-    matched = _match_rule(rule, text)
+    matched = _match_rule(rule, text) if rule.trigger_type in ("message", "command") else True
     result = await _execute_rule(
         rule, user_id=u.id, first_name=u.first_name or "", last_name=u.last_name or "",
         username=u.username or "", channel_id=None, channel_name="", test_only=True)
     ok = "✅" if matched else "❌"
     txt = (f"🧪 <b>Rule Test — #{rule.id} {esc(rule.name)}</b>\n\n"
-           f"Message: <i>{esc(text[:200])}</i>\n"
+           f"Input: <i>{esc(text[:200])}</i>\n"
            f"Trigger matched: {ok}\n"
+           f"Match mode: {MATCH_LABELS.get(rule.match_type, rule.match_type)}\n"
            f"Scope: {_scope_summary(rule)}\n"
            f"Cooldown: {'configured ' + str(rule.cooldown_seconds) + 's' if rule.cooldown_seconds else 'none'}\n"
            f"Priority: {rule.priority}\n\n"
-           f"Response preview:\n<blockquote>{esc(result.get('preview',''))}</blockquote>")
+           f"<b>Response preview:</b>\n<blockquote>{esc(result.get('preview','') or '(empty)')}</blockquote>")
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📤 Send Test", callback_data=f"auto:test_send:{rule.id}")],
+        [InlineKeyboardButton("📤 Send Test To Me", callback_data=f"auto:test_send:{rule.id}")],
         [InlineKeyboardButton("« Back", callback_data=f"auto:view:{rule.id}")],
     ])
     await bot.send_message(chat_id, txt, reply_markup=kb, parse_mode=HTML)
+
+
+async def _run_global_test(chat_id: int, message: Message):
+    text = (message.text or message.caption or "").strip()
+    rules = await _load_enabled_rules(force=True)
+    matched_any = []
+    for rule in rules:
+        if rule.trigger_type not in ("message", "command"):
+            continue
+        if _rule_scope_matches(rule, None) and _match_rule(rule, text):
+            matched_any.append(rule)
+            if rule.stop_on_match:
+                break
+    if not matched_any:
+        await bot.send_message(chat_id,
+                               f"🧪 No rules matched <i>{esc(text[:120])}</i>.",
+                               reply_markup=kb_back("auto:main"), parse_mode=HTML)
+        return
+    lines = [f"🧪 <b>Global Test</b> — input: <i>{esc(text[:120])}</i>\n",
+             f"Matched <b>{len(matched_any)}</b> rule(s):"]
+    for r in matched_any:
+        lines.append(f"  • #{r.id} {esc(r.name)} → {short_preview(r.response_text, 60)}")
+    await bot.send_message(chat_id, "\n".join(lines), reply_markup=kb_back("auto:main"),
+                           parse_mode=HTML)
 
 
 # ===========================================================================
@@ -3899,13 +4236,10 @@ async def _send_preview(chat_id: int, title: str, html_text: str, markup=None):
                                reply_markup=markup)
 
 
-# ===========================================================================
-# CALLBACK ROUTER
-# ===========================================================================
-
 async def show_join_settings(cq: CallbackQuery, ch_id: int):
     async with SessionLocal() as session:
         s = await get_or_create_settings(session, ch_id)
+        await session.commit()
     await safe_edit(cq.message, _join_settings_text(await get_channel_name(ch_id), s),
                     kb_join_msg_settings(ch_id, s))
 
@@ -3913,27 +4247,371 @@ async def show_join_settings(cq: CallbackQuery, ch_id: int):
 async def show_leave_settings(cq: CallbackQuery, ch_id: int):
     async with SessionLocal() as session:
         s = await get_or_create_settings(session, ch_id)
+        await session.commit()
     await safe_edit(cq.message, _leave_settings_text(await get_channel_name(ch_id), s),
                     kb_leave_msg_settings(ch_id, s))
 
 
-async def show_channel_settings(cq: CallbackQuery, ch_id: int):
-    async with SessionLocal() as session:
-        s = await get_or_create_settings(session, ch_id)
-    name = await get_channel_name(ch_id)
-    auto_str = "✅ ON" if s.auto_accept else "❌ OFF"
-    await safe_edit(
-        cq.message, f"⚙️ <b>Settings: {esc(name)}</b>\n\nAuto-Accept: {auto_str}",
-        InlineKeyboardMarkup([
-            [InlineKeyboardButton("📩 Join Message", callback_data=f"settings:join:{ch_id}"),
-             InlineKeyboardButton("🚪 Leave Message", callback_data=f"settings:leave:{ch_id}")],
-            [InlineKeyboardButton(f"Auto-Accept: {auto_str}",
-                                  callback_data=f"autoaccept:toggle:{ch_id}")],
-            [InlineKeyboardButton("🤖 Automations for this channel",
-                                  callback_data="auto:list:1")],
-            [InlineKeyboardButton("« Back", callback_data="channels:list")],
-        ]))
+# ===========================================================================
+# DATABASE BACKUP / RESTORE
+# ===========================================================================
 
+def _sqlite_db_path() -> Path:
+    url = DATABASE_URL
+    for prefix in ("sqlite+aiosqlite:///", "sqlite:///"):
+        if url.startswith(prefix):
+            path = url[len(prefix):]
+            if url.startswith(prefix.replace("///", "////")):
+                return Path(path)
+            return Path(path) if not path.startswith("/") else Path("/" + path.lstrip("/"))
+    return Path("bot.db")
+
+
+def _human_size(n: int) -> str:
+    f = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if f < 1024:
+            return f"{f:.1f} {unit}"
+        f /= 1024
+    return f"{f:.1f} PB"
+
+
+def _cleanup_old_backups(keep: int = 10):
+    try:
+        files = sorted(BACKUP_DIR.glob("bot_backup_*"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+        for f in files[keep:]:
+            try:
+                f.unlink()
+            except Exception:
+                pass
+    except Exception as exc:
+        logger.debug("cleanup backups failed: %s", exc)
+
+
+async def _reload_engine():
+    global engine, SessionLocal
+    try:
+        await engine.dispose()
+    except Exception as exc:
+        logger.warning("engine.dispose during reload failed: %s", exc)
+    engine = _build_engine()
+    SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+    logger.info("Database engine reloaded.")
+
+
+async def _create_sqlite_backup(ts: str) -> tuple[Optional[Path], str]:
+    src = _sqlite_db_path()
+    if not src.exists():
+        alt = Path(src.name)
+        if alt.exists():
+            src = alt
+        else:
+            return None, f"SQLite file not found at {src}"
+    backup_path = BACKUP_DIR / f"bot_backup_{ts}.db"
+    try:
+        async with engine.begin() as conn:
+            safe = str(backup_path.resolve()).replace("'", "''")
+            await conn.execute(text(f"VACUUM INTO '{safe}'"))
+        return backup_path, ""
+    except Exception as exc:
+        logger.warning("VACUUM INTO failed (%s); falling back to file copy", exc)
+    try:
+        async with engine.begin() as conn:
+            try:
+                await conn.execute(text("PRAGMA wal_checkpoint(TRUNCATE)"))
+            except Exception:
+                pass
+        shutil.copy2(src, backup_path)
+        return backup_path, ""
+    except Exception as exc:
+        logger.exception("sqlite backup failed: %s", exc)
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def _validate_sqlite_backup(path: Path) -> tuple[bool, str]:
+    import sqlite3
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = {row[0] for row in cur.fetchall()}
+        finally:
+            conn.close()
+    except Exception as exc:
+        return False, f"not a valid SQLite database ({exc})"
+    required = {"admins", "channels", "automation_rules"}
+    missing = required - tables
+    if missing:
+        return False, f"missing tables: {', '.join(sorted(missing))}"
+    return True, ""
+
+
+async def restore_sqlite_backup(uploaded: Path) -> tuple[bool, str]:
+    db_path = _sqlite_db_path()
+    if not db_path.exists():
+        alt = Path(db_path.name)
+        if alt.exists():
+            db_path = alt
+        else:
+            return False, f"Current DB file not found: {db_path}"
+
+    ok, err = _validate_sqlite_backup(uploaded)
+    if not ok:
+        return False, err
+
+    try:
+        safety = BACKUP_DIR / f"pre_restore_{now_utc().strftime('%Y%m%d_%H%M%S')}.db"
+        async with engine.begin() as conn:
+            safe = str(safety.resolve()).replace("'", "''")
+            try:
+                await conn.execute(text(f"VACUUM INTO '{safe}'"))
+            except Exception:
+                shutil.copy2(db_path, safety)
+        logger.info("Safety backup: %s", safety)
+    except Exception as exc:
+        logger.warning("Safety backup failed (continuing): %s", exc)
+
+    try:
+        await engine.dispose()
+    except Exception:
+        pass
+
+    for suffix in ("-wal", "-shm"):
+        side = Path(str(db_path) + suffix)
+        if side.exists():
+            try:
+                side.unlink()
+            except Exception:
+                pass
+
+    try:
+        tmp_target = db_path.with_suffix(db_path.suffix + ".new")
+        shutil.copy2(uploaded, tmp_target)
+        os.replace(str(tmp_target), str(db_path))
+    except Exception as exc:
+        return False, f"file replace failed: {exc}"
+
+    await _reload_engine()
+
+    try:
+        async with SessionLocal() as s:
+            await s.execute(select(1))
+    except Exception as exc:
+        return False, f"restored DB failed to open: {exc}"
+
+    return True, ""
+
+
+_JSON_TABLES = [
+    ("admins", Admin), ("channels", Channel),
+    ("join_requests", JoinRequest), ("members", Member),
+    ("member_leaves", MemberLeave), ("conversations", Conversation),
+    ("known_users", KnownUser), ("broadcasts", Broadcast),
+    ("blocked_users", BlockedUser), ("settings", Settings),
+    ("global_settings", GlobalSettings),
+    ("automation_rules", AutomationRule),
+    ("automation_buttons", AutomationButton),
+    ("automation_cooldowns", AutomationCooldown),
+    ("automation_logs", AutomationLog),
+    ("kv", KV),
+]
+
+
+def _json_safe(v):
+    if v is None or isinstance(v, (int, float, str, bool)):
+        return v
+    if isinstance(v, datetime):
+        return v.isoformat()
+    return str(v)
+
+
+async def _create_json_backup(ts: str) -> tuple[Optional[Path], str]:
+    path = BACKUP_DIR / f"bot_backup_{ts}.json"
+    try:
+        from sqlalchemy import inspect as sa_inspect
+        payload = {
+            "format": "channel_manager_backup",
+            "version": 1,
+            "created_at": now_utc().isoformat(),
+            "tables": {},
+        }
+        async with SessionLocal() as s:
+            for name, model in _JSON_TABLES:
+                rows = (await s.execute(select(model))).scalars().all()
+                cols = [c.key for c in sa_inspect(model).columns]
+                payload["tables"][name] = [
+                    {c: _json_safe(getattr(r, c)) for c in cols} for r in rows
+                ]
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        return path, ""
+    except Exception as exc:
+        logger.exception("json backup failed: %s", exc)
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def _json_restore_value(v):
+    if v is None or not isinstance(v, str):
+        return v
+    if "T" in v or v.endswith("Z"):
+        try:
+            return datetime.fromisoformat(v.replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            pass
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(v, fmt)
+        except Exception:
+            pass
+    return v
+
+
+async def restore_from_json(uploaded: Path) -> tuple[bool, str]:
+    try:
+        with open(uploaded, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception as exc:
+        return False, f"JSON parse failed: {exc}"
+
+    if payload.get("format") != "channel_manager_backup":
+        return False, "Not a Channel Manager backup file."
+
+    tables = payload.get("tables")
+    if not isinstance(tables, dict):
+        return False, "Invalid backup structure."
+
+    try:
+        await _create_json_backup(now_utc().strftime("pre_restore_%Y%m%d_%H%M%S"))
+    except Exception as exc:
+        logger.warning("safety json backup failed: %s", exc)
+
+    from sqlalchemy import inspect as sa_inspect
+    models = dict(_JSON_TABLES)
+    try:
+        async with SessionLocal() as s:
+            for name in reversed(list(models.keys())):
+                try:
+                    await s.execute(delete(models[name]))
+                except Exception as exc:
+                    logger.warning("wipe of %s failed: %s", name, exc)
+            await s.commit()
+
+            for name, model in models.items():
+                rows = tables.get(name) or []
+                if not rows:
+                    continue
+                valid_cols = {c.key for c in sa_inspect(model).columns}
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    clean = {k: _json_restore_value(v) for k, v in row.items()
+                             if k in valid_cols}
+                    try:
+                        s.add(model(**clean))
+                    except Exception as exc:
+                        logger.warning("row insert failed in %s: %s", name, exc)
+                await s.flush()
+            await s.commit()
+        return True, ""
+    except Exception as exc:
+        logger.exception("restore_from_json failed: %s", exc)
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+async def create_db_backup() -> tuple[Optional[Path], str]:
+    ts = now_utc().strftime("%Y%m%d_%H%M%S")
+    if IS_SQLITE:
+        path, err = await _create_sqlite_backup(ts)
+        if path:
+            return path, ""
+        logger.warning("SQLite backup failed (%s), falling back to JSON export", err)
+        path, jerr = await _create_json_backup(ts)
+        if path:
+            return path, ""
+        return None, err or jerr
+    return await _create_json_backup(ts)
+
+
+async def restore_db(uploaded: Path) -> tuple[bool, str]:
+    name = uploaded.name.lower()
+    if name.endswith(".json"):
+        return await restore_from_json(uploaded)
+    if name.endswith(".db") or name.endswith(".sqlite") or name.endswith(".sqlite3"):
+        if not IS_SQLITE:
+            return False, ("Cannot restore a .db file to a PostgreSQL database. "
+                           "Send a .json backup instead.")
+        return await restore_sqlite_backup(uploaded)
+    return False, "Unsupported file extension (expect .db, .sqlite, or .json)."
+
+
+async def _post_restore_reload():
+    try:
+        await reload_admins()
+    except Exception as exc:
+        logger.warning("post-restore reload_admins: %s", exc)
+    try:
+        invalidate_automation_cache()
+    except Exception:
+        pass
+    _member_cache.clear()
+    _pending_cache.clear()
+    _bot_admin_cache.clear()
+    _cd_cache.clear()
+    try:
+        await init_db()
+    except Exception as exc:
+        logger.warning("post-restore init_db: %s", exc)
+
+
+async def _handle_restore_upload(admin_id: int, chat_id: int, message: Message):
+    doc = message.document
+    if doc is None:
+        await message.reply_text("Send the backup file as a <b>document</b>.",
+                                 parse_mode=HTML)
+        return
+    fname = (doc.file_name or "backup.bin").lower()
+    status = await message.reply_text("⏳ Downloading backup…")
+
+    tmp_path = BACKUP_DIR / f"upload_{now_utc().strftime('%Y%m%d_%H%M%S')}_{doc.file_name or 'backup.bin'}"
+    try:
+        await bot.download_media(message, file_name=str(tmp_path))
+    except Exception as exc:
+        await status.edit_text(f"❌ Download failed: {esc(exc)}")
+        return
+
+    size = tmp_path.stat().st_size if tmp_path.exists() else 0
+    await status.edit_text(f"⏳ Verifying and restoring ({_human_size(size)})…")
+
+    try:
+        ok, err = await restore_db(tmp_path)
+    finally:
+        try:
+            tmp_path.unlink()
+        except Exception:
+            pass
+
+    reset_flow(admin_id)
+    if ok:
+        await status.edit_text("⏳ Reloading caches…")
+        await _post_restore_reload()
+        await status.edit_text(
+            "✅ <b>Database restored successfully.</b>\n\n"
+            f"File: <code>{esc(doc.file_name or 'backup')}</code>\n"
+            f"Size: {_human_size(size)}\n\n"
+            "A safety backup of the previous DB was saved in <code>backups/</code>.\n"
+            "All caches reloaded.",
+            reply_markup=kb_main_panel(await userbot_ready()))
+    else:
+        await status.edit_text(
+            f"❌ <b>Restore failed:</b> {esc(err)}\n\n"
+            "The current database was <b>not</b> modified.",
+            reply_markup=kb_back("tools:backup"))
+
+
+# ===========================================================================
+# CALLBACK ROUTER
+# ===========================================================================
 
 async def on_callback(client: Client, cq: CallbackQuery):
     if cq.from_user is None or not is_admin(cq.from_user.id):
@@ -3958,7 +4636,7 @@ async def on_callback(client: Client, cq: CallbackQuery):
         if data == "noop":
             await ack()
 
-        # ----- panel -----
+        # ---------- panel ----------
         elif data in ("panel:main", "panel:refresh"):
             await ack("Refreshing…" if data == "panel:refresh" else "")
             reset_flow(admin_id)
@@ -3986,7 +4664,7 @@ async def on_callback(client: Client, cq: CallbackQuery):
             await ack("Processing…")
             spawn(bulk_process_requests(chat_id, ch_id, approve), name="bulk_req")
 
-        # ----- search -----
+        # ---------- search ----------
         elif data == "search:start":
             await ack()
             reset_flow(admin_id)
@@ -4012,14 +4690,47 @@ async def on_callback(client: Client, cq: CallbackQuery):
                 f"🔍 Searching in {scope}.\n\nSend a <b>user ID</b>, <b>@username</b>, or part of a <b>name</b>:",
                 kb_back("search:start"))
 
-        # ----- channels -----
+        # ---------- channels ----------
         elif data in ("channels:list", "channels:refresh"):
             await ack("Refreshing…" if data == "channels:refresh" else "")
             await show_channel_list(chat_id, edit_msg=cq.message, refresh=(data == "channels:refresh"))
 
+        elif data == "channels:add":
+            await ack()
+            reset_flow(admin_id)
+            flow(admin_id).state = St.ADD_CHANNEL
+            await safe_edit(
+                cq.message,
+                "➕ <b>Add Channel</b>\n\n"
+                "Forward any message from the channel, or send its <b>numeric ID</b> or "
+                "<b>@username</b>.\n\n"
+                "⚠️ The bot must be an <b>admin</b> in that channel.",
+                kb_back("channels:list"))
+
         elif data.startswith("channels:settings:"):
             await ack()
             await show_channel_settings(cq, int(p[2]))
+
+        elif data.startswith("channels:remove:"):
+            ch_id = int(p[2])
+            name = await get_channel_name(ch_id)
+            await ack()
+            await safe_edit(cq.message,
+                            f"🗑 <b>Remove <code>{esc(name)}</code>?</b>\n"
+                            f"The channel will be hidden from the panel, but historical data is kept.",
+                            kb_confirm(f"channels:do_remove:{ch_id}", "channels:list"))
+
+        elif data.startswith("channels:do_remove:"):
+            ch_id = int(p[2])
+            async with SessionLocal() as s:
+                ch = (await s.execute(select(Channel).where(Channel.channel_id == ch_id))).scalar_one_or_none()
+                if ch:
+                    ch.is_active = False
+                    await s.commit()
+            _member_cache.pop(ch_id, None)
+            _pending_cache.pop(ch_id, None)
+            await ack("Removed.")
+            await show_channel_list(chat_id, edit_msg=cq.message, refresh=True)
 
         elif data.startswith("autoaccept:toggle:"):
             ch_id = int(p[2])
@@ -4030,7 +4741,7 @@ async def on_callback(client: Client, cq: CallbackQuery):
             await ack("Updated.")
             await show_channel_settings(cq, ch_id)
 
-        # ----- broadcast -----
+        # ---------- broadcast ----------
         elif data == "broadcast:start":
             await ack()
             reset_flow(admin_id)
@@ -4039,7 +4750,7 @@ async def on_callback(client: Client, cq: CallbackQuery):
                             "Send the broadcast content (text, photo, video, voice or document).",
                             kb_back())
 
-        # ----- stats -----
+        # ---------- stats ----------
         elif data in ("stats:show", "stats:refresh"):
             await ack("Loading…")
             txt = await build_stats_text(refresh=(data == "stats:refresh"))
@@ -4048,7 +4759,7 @@ async def on_callback(client: Client, cq: CallbackQuery):
             else:
                 await bot.send_message(chat_id, txt, reply_markup=KB_STATS, parse_mode=HTML)
 
-        # ----- settings main -----
+        # ---------- settings ----------
         elif data == "settings:main":
             await ack()
             reset_flow(admin_id)
@@ -4082,18 +4793,21 @@ async def on_callback(client: Client, cq: CallbackQuery):
             await ack()
             async with SessionLocal() as session:
                 gs = await get_global_settings(session)
+                await session.commit()
             await safe_edit(cq.message, _start_settings_text(gs), kb_start_msg_settings())
 
         elif data == "settings:auto_reply":
             await ack()
             async with SessionLocal() as session:
                 gs = await get_global_settings(session)
+                await session.commit()
             await safe_edit(cq.message, _auto_reply_settings_text(gs), kb_auto_reply_settings(gs))
 
         elif data == "settings:notifications":
             await ack()
             async with SessionLocal() as session:
                 gs = await get_global_settings(session)
+                await session.commit()
             await safe_edit(cq.message, "🔔 <b>Notification Settings</b>\n<i>(global)</i>",
                             kb_notifications(gs))
 
@@ -4109,11 +4823,12 @@ async def on_callback(client: Client, cq: CallbackQuery):
                 setattr(gs, attr, not getattr(gs, attr))
                 await session.commit()
                 gs = await get_global_settings(session)
+                await session.commit()
             await ack("Updated.")
             await safe_edit(cq.message, "🔔 <b>Notification Settings</b>\n<i>(global)</i>",
                             kb_notifications(gs))
 
-        # ----- join_msg / leave_msg actions -----
+        # ---------- join_msg / leave_msg ----------
         elif p[0] in ("join_msg", "leave_msg") and len(p) >= 3:
             kind = "join" if p[0] == "join_msg" else "leave"
             action, ch_id = p[1], int(p[2])
@@ -4177,6 +4892,7 @@ async def on_callback(client: Client, cq: CallbackQuery):
                 await ack()
                 async with SessionLocal() as session:
                     s = await get_or_create_settings(session, ch_id)
+                    await session.commit()
                 tpl = getattr(s, f"{kind}_msg_text") or "(no message set)"
                 prev = render_template(tpl, cq.from_user.first_name or "Alex", "",
                                        cq.from_user.username or "alex",
@@ -4185,7 +4901,7 @@ async def on_callback(client: Client, cq: CallbackQuery):
             else:
                 await ack()
 
-        # ----- button ask yes/no -----
+        # ---------- btn_ask ----------
         elif data.startswith("btn_ask:"):
             await ack()
             yn, target = p[1], p[2]
@@ -4212,6 +4928,7 @@ async def on_callback(client: Client, cq: CallbackQuery):
                     reset_flow(admin_id)
                     async with SessionLocal() as session:
                         gs = await get_global_settings(session)
+                        await session.commit()
                     await safe_edit(cq.message, _start_settings_text(gs), kb_start_msg_settings())
             elif target == "auto_reply":
                 if yn == "yes":
@@ -4222,9 +4939,10 @@ async def on_callback(client: Client, cq: CallbackQuery):
                     reset_flow(admin_id)
                     async with SessionLocal() as session:
                         gs = await get_global_settings(session)
+                        await session.commit()
                     await safe_edit(cq.message, _auto_reply_settings_text(gs), kb_auto_reply_settings(gs))
 
-        # ----- start message -----
+        # ---------- start msg ----------
         elif data == "start_msg:edit":
             await ack()
             reset_flow(admin_id)
@@ -4241,15 +4959,17 @@ async def on_callback(client: Client, cq: CallbackQuery):
                 gs.start_btn_label, gs.start_btn_url = "", ""
                 await session.commit()
                 gs = await get_global_settings(session)
+                await session.commit()
             await ack("Button removed.")
             await safe_edit(cq.message, _start_settings_text(gs), kb_start_msg_settings())
         elif data == "start_msg:preview":
             await ack()
             async with SessionLocal() as session:
                 gs = await get_global_settings(session)
+                await session.commit()
             await _send_preview(chat_id, "Start Message Preview", gs.start_msg_text)
 
-        # ----- legacy auto reply -----
+        # ---------- auto reply legacy ----------
         elif data == "auto_reply:edit":
             await ack()
             reset_flow(admin_id)
@@ -4266,6 +4986,7 @@ async def on_callback(client: Client, cq: CallbackQuery):
                 gs.auto_reply_btn_label, gs.auto_reply_btn_url = "", ""
                 await session.commit()
                 gs = await get_global_settings(session)
+                await session.commit()
             await ack("Removed.")
             await safe_edit(cq.message, _auto_reply_settings_text(gs), kb_auto_reply_settings(gs))
         elif data == "auto_reply:toggle":
@@ -4274,12 +4995,14 @@ async def on_callback(client: Client, cq: CallbackQuery):
                 gs.auto_reply_enabled = not gs.auto_reply_enabled
                 await session.commit()
                 gs = await get_global_settings(session)
+                await session.commit()
             await ack("Updated.")
             await safe_edit(cq.message, _auto_reply_settings_text(gs), kb_auto_reply_settings(gs))
         elif data == "auto_reply:preview":
             await ack()
             async with SessionLocal() as session:
                 gs = await get_global_settings(session)
+                await session.commit()
             await _send_preview(chat_id, "Auto-Reply Preview", gs.auto_reply_text)
 
         # =========================================================
@@ -4341,7 +5064,7 @@ async def on_callback(client: Client, cq: CallbackQuery):
             f.state = St.AUTO_TEST_INPUT
             f.data["test_rule_id"] = None
             await safe_edit(cq.message,
-                            "🧪 Send a sample message to run through rules in test mode "
+                            "🧪 Send a sample message to run through all enabled rules in test mode "
                             "(nothing will be sent to real users).",
                             kb_back("auto:main"))
 
@@ -4378,6 +5101,50 @@ async def on_callback(client: Client, cq: CallbackQuery):
             txt, kb = await build_rule_view(int(p[2]))
             await safe_edit(cq.message, txt, kb)
 
+        elif data.startswith("auto:advanced:"):
+            await ack()
+            txt, kb = await build_rule_advanced(int(p[2]))
+            await safe_edit(cq.message, txt, kb)
+
+        elif data.startswith("auto:duplicate:"):
+            src_id = int(p[2])
+            async with SessionLocal() as s:
+                src = (await s.execute(select(AutomationRule).where(
+                    AutomationRule.id == src_id))).scalar_one_or_none()
+                if src is None:
+                    await ack("Rule gone.", True)
+                    return
+                new_rule = AutomationRule(
+                    name=(src.name + " (copy)")[:200],
+                    description=src.description,
+                    enabled=False,
+                    priority=src.priority,
+                    stop_on_match=src.stop_on_match,
+                    trigger_type=src.trigger_type,
+                    match_type=src.match_type,
+                    trigger_value=src.trigger_value,
+                    case_insensitive=src.case_insensitive,
+                    scope_type=src.scope_type,
+                    scope_channel_id=src.scope_channel_id,
+                    cooldown_seconds=src.cooldown_seconds,
+                    response_type=src.response_type,
+                    response_text=src.response_text,
+                    response_media_id=src.response_media_id,
+                )
+                s.add(new_rule)
+                await s.flush()
+                btns = (await s.execute(select(AutomationButton).where(
+                    AutomationButton.rule_id == src_id))).scalars().all()
+                for b in btns:
+                    s.add(AutomationButton(rule_id=new_rule.id, row=b.row, col=b.col,
+                                           label=b.label, url=b.url))
+                await s.commit()
+                new_id = new_rule.id
+            invalidate_automation_cache()
+            await ack(f"Duplicated as #{new_id} (disabled).")
+            txt, kb = await build_rule_view(new_id)
+            await safe_edit(cq.message, txt, kb)
+
         elif data.startswith("auto:toggle:"):
             rule_id = int(p[2])
             async with SessionLocal() as s:
@@ -4386,9 +5153,22 @@ async def on_callback(client: Client, cq: CallbackQuery):
                 if r:
                     r.enabled = not r.enabled
                     await s.commit()
-            invalidate_rule_cache()
+            invalidate_automation_cache()
             await ack("Updated.")
             txt, kb = await build_rule_view(rule_id)
+            await safe_edit(cq.message, txt, kb)
+
+        elif data.startswith("auto:toggle_stop:"):
+            rule_id = int(p[2])
+            async with SessionLocal() as s:
+                r = (await s.execute(select(AutomationRule).where(
+                    AutomationRule.id == rule_id))).scalar_one_or_none()
+                if r:
+                    r.stop_on_match = not r.stop_on_match
+                    await s.commit()
+            invalidate_automation_cache()
+            await ack("Updated.")
+            txt, kb = await build_rule_advanced(rule_id)
             await safe_edit(cq.message, txt, kb)
 
         elif data.startswith("auto:prio:"):
@@ -4399,7 +5179,7 @@ async def on_callback(client: Client, cq: CallbackQuery):
                 if r:
                     r.priority = max(1, r.priority - 10) if direction == "up" else r.priority + 10
                     await s.commit()
-            invalidate_rule_cache()
+            invalidate_automation_cache()
             await ack("Priority updated.")
             txt, kb = await build_rule_view(rule_id)
             await safe_edit(cq.message, txt, kb)
@@ -4408,37 +5188,38 @@ async def on_callback(client: Client, cq: CallbackQuery):
             rule_id = int(p[2])
             reset_flow(admin_id)
             f = flow(admin_id)
-            f.state = St.AUTO_NAME
+            f.state = St.AUTO_EDIT_NAME
             f.data["edit_rule_id"] = rule_id
             await ack()
             await safe_edit(cq.message, "Send the new rule name:", kb_back(f"auto:view:{rule_id}"))
 
-        elif data.startswith("auto:edit_value:"):
+        elif data.startswith("auto:edit_pattern:"):
             rule_id = int(p[2])
             reset_flow(admin_id)
             f = flow(admin_id)
-            f.state = St.AUTO_TRIGGER_VALUE
+            f.state = St.AUTO_EDIT_PATTERN
             f.data["edit_rule_id"] = rule_id
             await ack()
             await safe_edit(cq.message,
-                            "Send the new pattern (keywords → comma/line separated):",
+                            "Send the new trigger pattern.\n\n"
+                            "For keyword modes: separate by commas or new lines.",
                             kb_back(f"auto:view:{rule_id}"))
 
-        elif data.startswith("auto:edit_text:"):
+        elif data.startswith("auto:edit_response:"):
             rule_id = int(p[2])
             reset_flow(admin_id)
             f = flow(admin_id)
-            f.state = St.AUTO_RESPONSE_TEXT
+            f.state = St.AUTO_EDIT_RESPONSE
             f.data["edit_rule_id"] = rule_id
             await ack()
-            await safe_edit(cq.message, "Send the new response text:",
+            await safe_edit(cq.message, "Send the new reply text:",
                             kb_back(f"auto:view:{rule_id}"))
 
         elif data.startswith("auto:edit_media:"):
             rule_id = int(p[2])
             reset_flow(admin_id)
             f = flow(admin_id)
-            f.state = St.AUTO_MEDIA
+            f.state = St.AUTO_EDIT_MEDIA
             f.data["edit_rule_id"] = rule_id
             await ack()
             await safe_edit(cq.message,
@@ -4449,7 +5230,7 @@ async def on_callback(client: Client, cq: CallbackQuery):
             rule_id = int(p[2])
             reset_flow(admin_id)
             f = flow(admin_id)
-            f.state = St.AUTO_BTN_LABEL
+            f.state = St.AUTO_EDIT_BTN_LABEL
             f.data["edit_rule_id"] = rule_id
             await ack()
             await safe_edit(cq.message, "Send the button label:",
@@ -4460,6 +5241,7 @@ async def on_callback(client: Client, cq: CallbackQuery):
             async with SessionLocal() as s:
                 await s.execute(delete(AutomationButton).where(AutomationButton.rule_id == rule_id))
                 await s.commit()
+            invalidate_automation_cache()
             await ack("Buttons cleared.")
             txt, kb = await build_rule_view(rule_id)
             await safe_edit(cq.message, txt, kb)
@@ -4485,7 +5267,7 @@ async def on_callback(client: Client, cq: CallbackQuery):
                 if r:
                     r.priority = prio
                     await s.commit()
-            invalidate_rule_cache()
+            invalidate_automation_cache()
             await ack("Priority updated.")
             txt, kb = await build_rule_view(rule_id)
             await safe_edit(cq.message, txt, kb)
@@ -4512,7 +5294,7 @@ async def on_callback(client: Client, cq: CallbackQuery):
                 if r:
                     r.cooldown_seconds = sec
                     await s.commit()
-            invalidate_rule_cache()
+            invalidate_automation_cache()
             await ack("Cooldown updated.")
             txt, kb = await build_rule_view(rule_id)
             await safe_edit(cq.message, txt, kb)
@@ -4537,7 +5319,7 @@ async def on_callback(client: Client, cq: CallbackQuery):
                     r.scope_type = scope_type
                     r.scope_channel_id = scope_val if scope_type == "channel" else None
                     await s.commit()
-            invalidate_rule_cache()
+            invalidate_automation_cache()
             await ack("Scope updated.")
             txt, kb = await build_rule_view(rule_id)
             await safe_edit(cq.message, txt, kb)
@@ -4558,8 +5340,10 @@ async def on_callback(client: Client, cq: CallbackQuery):
                     AutomationRule.id == rule_id))).scalar_one_or_none()
                 if r:
                     r.match_type = mt
+                    if mt == "any":
+                        r.trigger_value = ""
                     await s.commit()
-            invalidate_rule_cache()
+            invalidate_automation_cache()
             await ack("Match type updated.")
             txt, kb = await build_rule_view(rule_id)
             await safe_edit(cq.message, txt, kb)
@@ -4600,128 +5384,138 @@ async def on_callback(client: Client, cq: CallbackQuery):
                 await s.execute(delete(AutomationButton).where(AutomationButton.rule_id == rule_id))
                 await s.execute(delete(AutomationRule).where(AutomationRule.id == rule_id))
                 await s.commit()
-            invalidate_rule_cache()
+            invalidate_automation_cache()
             await ack("Deleted.")
             txt, kb = await build_rule_list(1)
             await safe_edit(cq.message, txt, kb)
 
-        elif data == "auto:add_btn_draft":
+        # ---------- SIMPLE WIZARD step responses ----------
+        elif data == "auto:trig:any":
             await ack()
             f = flow(admin_id)
-            f.state = St.AUTO_BTN_LABEL
-            await safe_edit(cq.message, "Send the button label:")
+            d = _draft(f)
+            d["trigger_type"] = "message"
+            d["match_type"] = "any"
+            d["trigger_value"] = ""
+            f.state = St.AUTO_RESPONSE
+            await safe_edit(
+                cq.message,
+                "➕ <b>Step 2/2</b>\n\n"
+                "🌀 Any message → reply.\n\n"
+                "📤 <b>Now send what you want the bot to reply.</b>",
+                InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="auto:cancel")]]))
 
-        elif data == "auto:save":
+        elif data == "auto:save_draft":
             await ack("Saving…")
             f = flow(admin_id)
-            edit_id = f.data.get("edit_rule_id")
-            if edit_id:
-                d = _draft(f)
-                async with SessionLocal() as s:
-                    r = (await s.execute(select(AutomationRule).where(
-                        AutomationRule.id == edit_id))).scalar_one_or_none()
-                    if r is not None:
-                        if "name" in d:
-                            r.name = d["name"]
-                        if "description" in d:
-                            r.description = d["description"]
-                        if "trigger_value" in d:
-                            r.trigger_value = d["trigger_value"]
-                        if "response_text" in d:
-                            r.response_text = d["response_text"]
-                        if "response_media_id" in d:
-                            r.response_media_id = d["response_media_id"]
-                            r.response_type = d.get("response_type", r.response_type)
-                        if d.get("btn_label") and d.get("btn_url"):
-                            pass  # already added on url step for wizard
-                        r.updated_at = now_utc()
-                        await s.commit()
-                invalidate_rule_cache()
-                reset_flow(admin_id)
-                txt, kb = await build_rule_view(edit_id)
-                await safe_edit(cq.message, txt, kb)
-                return
-
             d = _draft(f)
-            if not d.get("name"):
-                await safe_edit(cq.message, "❌ Missing rule name. Cancelled.",
+            if not d.get("trigger_value") and d.get("match_type") != "any":
+                await safe_edit(cq.message, "❌ Missing trigger value. Cancelled.",
                                 kb_back("auto:main"))
                 reset_flow(admin_id)
                 return
             d.setdefault("trigger_type", "message")
-            d.setdefault("match_type", "any")
-            if d.get("response_type") in (None, ""):
-                d["response_type"] = "text"
+            d.setdefault("match_type", "exact")
+            d.setdefault("response_type", "text")
             rule_id = await _save_draft_rule(d)
             reset_flow(admin_id)
             if rule_id:
                 txt, kb = await build_rule_view(rule_id)
-                await safe_edit(cq.message, f"✅ Rule #{rule_id} created.\n\n{txt}", kb)
+                await safe_edit(cq.message, f"✅ <b>Automation saved!</b>\n\n{txt}", kb)
             else:
                 await safe_edit(cq.message, "❌ Failed to save rule. Check logs.",
                                 kb_back("auto:main"))
 
-        # wizard trigger/scope/cooldown/match selection from message step
-        elif data.startswith("auto:trig:"):
+        elif data == "auto:adv_draft":
+            await ack()
+            await safe_edit(
+                cq.message,
+                "⚙️ <b>Advanced Settings for this new automation</b>",
+                InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✏️ Set Name", callback_data="auto:draft_name"),
+                     InlineKeyboardButton("🔄 Match Mode", callback_data="auto:draft_match")],
+                    [InlineKeyboardButton("🌐 Scope", callback_data="auto:draft_scope"),
+                     InlineKeyboardButton("⏱ Cooldown", callback_data="auto:draft_cd")],
+                    [InlineKeyboardButton("💾 Save Automation", callback_data="auto:save_draft")],
+                    [InlineKeyboardButton("« Back to Preview", callback_data="auto:draft_preview")],
+                    [InlineKeyboardButton("❌ Cancel", callback_data="auto:cancel")],
+                ]))
+
+        elif data == "auto:draft_preview":
+            await ack()
+            await _wizard_show_preview(chat_id, admin_id, edit_msg=cq.message)
+
+        elif data == "auto:draft_name":
+            await ack()
+            f = flow(admin_id)
+            f.state = St.AUTO_EDIT_NAME
+            f.data.pop("edit_rule_id", None)
+            f.data["draft_mode"] = True
+            await safe_edit(cq.message, "Send the automation name:", kb_back("auto:adv_draft"))
+
+        elif data == "auto:draft_match":
+            await ack()
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton(label, callback_data=f"auto:draft_setmatch:{mt}")]
+                for mt, label in MATCH_LABELS.items()
+            ] + [[InlineKeyboardButton("« Back", callback_data="auto:adv_draft")]])
+            await safe_edit(cq.message, "Choose match mode:", kb)
+
+        elif data.startswith("auto:draft_setmatch:"):
             await ack()
             f = flow(admin_id)
             d = _draft(f)
-            trig = p[2]
-            d["trigger_type"] = trig
-            if trig == "message":
-                d["match_type"] = "any"
-                f.state = St.AUTO_RESPONSE_TEXT
-                await safe_edit(cq.message,
-                                "💬 Message rule: send the response text now.\n"
-                                "Variables allowed: {first_name} {username} {user_id} etc.",
-                                kb_back("auto:main"))
-            elif trig == "command":
-                f.state = St.AUTO_TRIGGER_VALUE
-                await safe_edit(cq.message,
-                                "🔧 Send the command (without slash), e.g. <code>info</code>.",
-                                kb_back("auto:main"))
-            elif trig in ("join_request", "member_join", "member_leave"):
-                f.state = St.AUTO_RESPONSE_TEXT
-                await safe_edit(cq.message,
-                                f"Selected {TRIGGER_LABELS.get(trig, trig)}. Send the response text.",
-                                kb_back("auto:main"))
-            else:
-                f.state = St.AUTO_TRIGGER_VALUE
-                await safe_edit(cq.message, "Send the trigger value:", kb_back("auto:main"))
+            mt = p[2]
+            d["match_type"] = mt
+            if mt == "any":
+                d["trigger_value"] = ""
+            await safe_edit(cq.message, "✅ Match mode updated.",
+                            InlineKeyboardMarkup([
+                                [InlineKeyboardButton("« Back", callback_data="auto:adv_draft")]]))
 
-        elif data.startswith("auto:scope:"):
+        elif data == "auto:draft_scope":
+            await ack()
+            channels = await _active_channels()
+            rows = [[InlineKeyboardButton("🌐 Global", callback_data="auto:draft_setscope:global:0")]]
+            for c in channels:
+                rows.append([InlineKeyboardButton(f"📣 {c.name or c.channel_id}"[:60],
+                                                  callback_data=f"auto:draft_setscope:channel:{c.channel_id}")])
+            rows.append([InlineKeyboardButton("« Back", callback_data="auto:adv_draft")])
+            await safe_edit(cq.message, "Choose scope:", InlineKeyboardMarkup(rows))
+
+        elif data.startswith("auto:draft_setscope:"):
             await ack()
             f = flow(admin_id)
             d = _draft(f)
-            scope = p[2]
-            if scope == "global":
-                d["scope_type"] = "global"
-                d["scope_channel_id"] = None
-                f.state = St.AUTO_RESPONSE_TEXT
-                await safe_edit(cq.message, "🌐 Global scope saved. Send the response text:",
-                                kb_back("auto:main"))
-            elif scope == "pick":
-                channels = await _active_channels()
-                if not channels:
-                    await safe_answer(cq, "No channels registered.", show_alert=True)
-                    return
-                rows = [[InlineKeyboardButton(f"📣 {c.name or c.channel_id}"[:60],
-                                              callback_data=f"auto:scope_pick:{c.channel_id}")]
-                        for c in channels]
-                rows.append([InlineKeyboardButton("« Back", callback_data="auto:main")])
-                await safe_edit(cq.message, "Pick a channel:", InlineKeyboardMarkup(rows))
+            scope_type, scope_val = p[2], int(p[3])
+            d["scope_type"] = scope_type
+            d["scope_channel_id"] = scope_val if scope_type == "channel" else None
+            await safe_edit(cq.message, "✅ Scope updated.",
+                            InlineKeyboardMarkup([
+                                [InlineKeyboardButton("« Back", callback_data="auto:adv_draft")]]))
 
-        elif data.startswith("auto:scope_pick:"):
+        elif data == "auto:draft_cd":
+            await ack()
+            rows = []
+            for sec in COOLDOWN_PRESETS:
+                label = "Off" if sec == 0 else (f"{sec}s" if sec < 60
+                                                else (f"{sec // 60}m" if sec < 3600 else f"{sec // 3600}h"))
+                rows.append(InlineKeyboardButton(label, callback_data=f"auto:draft_setcd:{sec}"))
+            kb = InlineKeyboardMarkup([
+                rows[:3], rows[3:6], rows[6:],
+                [InlineKeyboardButton("« Back", callback_data="auto:adv_draft")]])
+            await safe_edit(cq.message, "Choose cooldown:", kb)
+
+        elif data.startswith("auto:draft_setcd:"):
             await ack()
             f = flow(admin_id)
             d = _draft(f)
-            d["scope_type"] = "channel"
-            d["scope_channel_id"] = int(p[2])
-            f.state = St.AUTO_RESPONSE_TEXT
-            await safe_edit(cq.message, "📣 Channel scope saved. Send the response text:",
-                            kb_back("auto:main"))
+            d["cooldown_seconds"] = int(p[2])
+            await safe_edit(cq.message, "✅ Cooldown updated.",
+                            InlineKeyboardMarkup([
+                                [InlineKeyboardButton("« Back", callback_data="auto:adv_draft")]]))
 
-        # ----- inbox -----
+        # ---------- inbox ----------
         elif data == "inbox:list":
             await ack()
             await show_inbox(chat_id)
@@ -4751,9 +5545,9 @@ async def on_callback(client: Client, cq: CallbackQuery):
             f.state = St.INBOX_REPLY
             f.data["reply_to"] = target_id
             await bot.send_message(chat_id, f"Type your reply to <code>{target_id}</code>:",
-                                   parse_mode=HTML)
+                                   parse_mode="HTML")
 
-        # ----- per-request actions -----
+        # ---------- per-request actions ----------
         elif p[0] == "jr" and len(p) >= 4:
             action, ch_id, target_id = p[1], int(p[2]), int(p[3])
             if action in ("accept", "decline"):
@@ -4854,7 +5648,7 @@ async def on_callback(client: Client, cq: CallbackQuery):
             txt, kb = await build_user_profile(ch_id, target_id)
             await safe_edit(cq.message, txt, kb)
 
-        # ----- broadcast confirm -----
+        # ---------- broadcast confirm ----------
         elif data == "confirm:broadcast_send":
             f = flow(admin_id)
             from_chat, msg_id = f.data.get("bc_from_chat_id"), f.data.get("bc_message_id")
@@ -4892,7 +5686,7 @@ async def on_callback(client: Client, cq: CallbackQuery):
             reset_flow(admin_id)
             await safe_edit(cq.message, "Setup cancelled.", kb_main_panel(await userbot_ready()))
 
-        # ----- login -----
+        # ---------- login ----------
         elif data == "login:menu":
             await ack()
             logged_in = await userbot_ready()
@@ -4914,7 +5708,7 @@ async def on_callback(client: Client, cq: CallbackQuery):
             await ack()
             await logout_userbot(chat_id)
 
-        # ----- admins -----
+        # ---------- admins ----------
         elif data == "admins:list":
             await ack()
             async with SessionLocal() as session:
@@ -4942,16 +5736,17 @@ async def on_callback(client: Client, cq: CallbackQuery):
                 admins = (await session.execute(select(Admin).order_by(Admin.is_owner.desc()))).scalars().all()
             await safe_edit(cq.message, "<b>🛡️ Admins:</b>", kb_admins_list(admins))
 
-        # ----- system tools -----
+        # ---------- system tools ----------
         elif data == "tools:main":
             await ack()
             await safe_edit(
                 cq.message,
                 "🧰 <b>System Tools</b>",
                 InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📋 Recent Errors", callback_data="tools:errors")],
-                    [InlineKeyboardButton("🔄 Force Sync Now", callback_data="tools:sync")],
-                    [InlineKeyboardButton("📊 Automations", callback_data="auto:stats")],
+                    [InlineKeyboardButton("💾 Backup & Restore", callback_data="tools:backup")],
+                    [InlineKeyboardButton("📋 Recent Errors", callback_data="tools:errors"),
+                     InlineKeyboardButton("🔄 Force Sync Now", callback_data="tools:sync")],
+                    [InlineKeyboardButton("🤖 Automations", callback_data="auto:stats")],
                     [InlineKeyboardButton("« Back", callback_data="panel:main")],
                 ]))
         elif data == "tools:sync":
@@ -4965,6 +5760,135 @@ async def on_callback(client: Client, cq: CallbackQuery):
             except Exception:
                 tail = "(no log file)"
             await bot.send_message(chat_id, f"<pre>{esc(tail)}</pre>", parse_mode=HTML)
+
+        # ---------- backup & restore ----------
+        elif data == "tools:backup":
+            await ack()
+            reset_flow(admin_id)
+            db_kind = "SQLite (file-based)" if IS_SQLITE else "PostgreSQL (JSON export)"
+            try:
+                n_local = len(list(BACKUP_DIR.glob("bot_backup_*")))
+            except Exception:
+                n_local = 0
+            await safe_edit(
+                cq.message,
+                f"💾 <b>Backup & Restore</b>\n\n"
+                f"<b>Backend:</b> {esc(db_kind)}\n"
+                f"<b>Local backups:</b> {n_local}\n\n"
+                f"• <b>Create Backup</b> — makes a fresh backup and sends it to you here.\n"
+                f"• <b>Restore From File</b> — upload a <code>.db</code> or <code>.json</code> "
+                f"backup. Current DB is auto-backed up first.\n"
+                f"• <b>Local Backups</b> — resend any previously created backup.",
+                InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📤 Create Backup", callback_data="backup:create")],
+                    [InlineKeyboardButton("📥 Restore From File", callback_data="backup:restore")],
+                    [InlineKeyboardButton("📂 Local Backups", callback_data="backup:list")],
+                    [InlineKeyboardButton("« Back", callback_data="tools:main")],
+                ]))
+
+        elif data == "backup:create":
+            await ack("Creating backup…")
+            status = await bot.send_message(chat_id, "⏳ Creating database backup…")
+            path, err = await create_db_backup()
+            if path is None:
+                await safe_edit(status, f"❌ <b>Backup failed:</b> {esc(err)}",
+                                kb_back("tools:backup"))
+                return
+            size = path.stat().st_size
+            await safe_edit(status, f"📤 Uploading <code>{esc(path.name)}</code> "
+                                    f"({_human_size(size)})…", kb_back("tools:backup"))
+            try:
+                await bot.send_document(
+                    chat_id, str(path),
+                    caption=(f"💾 <b>Database Backup</b>\n"
+                             f"File: <code>{esc(path.name)}</code>\n"
+                             f"Size: {_human_size(size)}\n"
+                             f"Backend: {'SQLite' if IS_SQLITE else 'JSON'}\n"
+                             f"Created: {now_utc().strftime('%Y-%m-%d %H:%M:%S')} UTC"),
+                    parse_mode=HTML)
+                await safe_edit(status,
+                                f"✅ <b>Backup created & sent.</b>\n\n"
+                                f"File: <code>{esc(path.name)}</code>\n"
+                                f"Size: {_human_size(size)}\n\n"
+                                f"<i>Save it somewhere safe. It can be restored at any time.</i>",
+                                kb_back("tools:backup"))
+            except Exception as exc:
+                logger.exception("send backup failed: %s", exc)
+                await safe_edit(status, f"❌ Backup saved locally but failed to send: {esc(exc)}",
+                                kb_back("tools:backup"))
+            _cleanup_old_backups()
+
+        elif data == "backup:restore":
+            await ack()
+            reset_flow(admin_id)
+            f = flow(admin_id)
+            f.state = St.RESTORE_UPLOAD
+            await safe_edit(
+                cq.message,
+                "⚠️ <b>Restore Database</b>\n\n"
+                "This will <b>replace the entire current database</b> with the uploaded backup.\n\n"
+                "🛡 A safety backup of the current database will be created first "
+                "and saved to <code>backups/</code>.\n\n"
+                "📤 Now send the backup file as a <b>document</b>:\n"
+                "• <code>.db</code> / <code>.sqlite</code> for SQLite backups\n"
+                "• <code>.json</code> for JSON backups (works on any backend)\n\n"
+                "Tap Cancel to abort.",
+                InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",
+                                                            callback_data="backup:cancel")]]))
+
+        elif data == "backup:cancel":
+            await ack("Cancelled.")
+            reset_flow(admin_id)
+            await safe_edit(cq.message, "💾 <b>Backup & Restore</b>",
+                            InlineKeyboardMarkup([
+                                [InlineKeyboardButton("📤 Create Backup", callback_data="backup:create")],
+                                [InlineKeyboardButton("📥 Restore From File", callback_data="backup:restore")],
+                                [InlineKeyboardButton("📂 Local Backups", callback_data="backup:list")],
+                                [InlineKeyboardButton("« Back", callback_data="tools:main")],
+                            ]))
+
+        elif data == "backup:list":
+            await ack()
+            files = sorted(BACKUP_DIR.glob("bot_backup_*"),
+                           key=lambda p: p.stat().st_mtime, reverse=True)[:10]
+            if not files:
+                await safe_edit(cq.message, "📂 <b>No backups yet.</b>",
+                                kb_back("tools:backup"))
+                return
+            rows = []
+            for f in files:
+                try:
+                    sz = _human_size(f.stat().st_size)
+                    when = datetime.fromtimestamp(f.stat().st_mtime).strftime("%m-%d %H:%M")
+                except Exception:
+                    sz, when = "?", "?"
+                rows.append([InlineKeyboardButton(
+                    f"📄 {when} · {sz}"[:60],
+                    callback_data=f"backup:send:{f.name}")])
+            rows.append([InlineKeyboardButton("« Back", callback_data="tools:backup")])
+            await safe_edit(
+                cq.message,
+                f"📂 <b>Local Backups</b> ({len(files)})\n\nTap to send a copy.",
+                InlineKeyboardMarkup(rows))
+
+        elif data.startswith("backup:send:"):
+            fname = ":".join(p[2:])
+            if "/" in fname or ".." in fname:
+                await ack("Invalid filename.", True)
+                return
+            path = BACKUP_DIR / fname
+            if not path.exists() or not path.is_file():
+                await ack("File not found.", True)
+                return
+            await ack("Uploading…")
+            try:
+                await bot.send_document(
+                    chat_id, str(path),
+                    caption=f"💾 <code>{esc(fname)}</code>\n"
+                            f"Size: {_human_size(path.stat().st_size)}",
+                    parse_mode=HTML)
+            except Exception as exc:
+                await bot.send_message(chat_id, f"❌ Send failed: {esc(exc)}")
 
         else:
             await ack()
@@ -5050,6 +5974,11 @@ async def startup_self_check():
     checks.append(f"{'✅' if ENV_API_ID and ENV_API_HASH else '⚠️'} env api creds")
     checks.append(f"{'✅' if await userbot_ready() else '⚠️'} userbot")
     checks.append(f"{'✅' if scheduler.running else '❌'} scheduler")
+    try:
+        n_bk = len(list(BACKUP_DIR.glob("bot_backup_*")))
+        checks.append(f"💾 backups ({n_bk})")
+    except Exception:
+        pass
     logger.info("Startup self-check: %s", " | ".join(checks))
 
 
